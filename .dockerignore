@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!selector.py
+!coverage_selector.py
+!vendor/
+vendor/*
+!vendor/coverage.json.gz
+!vendor/sqlglot-eb11aec.tar.gz

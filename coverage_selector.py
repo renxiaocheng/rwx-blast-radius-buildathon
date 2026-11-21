@@ -34,6 +34,16 @@ class SourceFile:
     bodies: list[FunctionBody]
 
 
+@dataclass
+class CoverageIndex:
+    lines: dict[str, dict[int, set[int]]]
+    unmeasured: set[int]
+    collection: dict[str, set[int]]
+    fixtures: dict[str, set[int]]
+    shared_fixtures: set[str]
+    subprocess_coverage: bool
+
+
 def parse_patch(patch: str) -> list[tuple[str, list[Edit]]] | None:
     """Return changed blocks at old-file line positions for ordinary Git diffs."""
     rows = patch.split("\n")
@@ -114,9 +124,7 @@ def covered_lines(spans: Iterable[int | list[int]]) -> Iterable[int]:
             yield from range(span[0], span[1] + 1)
 
 
-def read_coverage(
-    path: Path, numbers_by_id: dict[str, int]
-) -> tuple[dict[str, dict[int, set[int]]], set[int], dict[str, set[int]]]:
+def read_coverage(path: Path, numbers_by_id: dict[str, int]) -> CoverageIndex:
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", encoding="utf-8") as stream:
         coverage = json.load(stream)
@@ -142,10 +150,25 @@ def read_coverage(
             for line in covered_lines(spans):
                 by_line[filename][line].add(number)
 
-    unknown = {number_map[str(number)] for number in coverage.get("unmeasured", []) if str(number) in number_map}
+    unknown = {
+        number_map[str(number)] for number in coverage.get("unmeasured", []) if str(number) in number_map
+    }
     unmeasured_tests = (test_numbers - measured_tests) | unknown
-    collection = {name: set(covered_lines(spans)) for name, spans in coverage.get("collection", {}).items()}
-    return by_line, unmeasured_tests, collection
+    collection = {
+        name: set(covered_lines(spans)) for name, spans in coverage.get("collection", {}).items()
+    }
+    fixtures = {
+        name: {number_map[str(number)] for number in numbers if str(number) in number_map}
+        for name, numbers in coverage.get("fixtures", {}).items()
+    }
+    return CoverageIndex(
+        by_line,
+        unmeasured_tests,
+        collection,
+        fixtures,
+        set(coverage.get("fixture_collection", [])),
+        coverage.get("subprocess_coverage") is True,
+    )
 
 
 def read_source(path: Path) -> SourceFile:
@@ -235,9 +258,7 @@ def impacted_tests(
 
 def select_tests(
     patch: str,
-    by_file: dict[str, dict[int, set[int]]],
-    unmeasured: set[int],
-    collection: dict[str, set[int]],
+    coverage: CoverageIndex,
     source: Path,
     source_cache: dict[str, SourceFile | None],
 ) -> set[int] | None:
@@ -245,9 +266,17 @@ def select_tests(
     if files is None:
         return None
 
-    selected = set(unmeasured)
+    selected = set(coverage.unmeasured)
     for name, edits in files:
-        if not name.startswith("sqlglot/") or not name.endswith(".py") or name not in by_file:
+        if name.startswith("tests/fixtures/") and name.endswith(".sql"):
+            consumers = coverage.fixtures.get(name)
+            # Fixtures opened during setup or collection can be shared by tests
+            # that never open the file themselves.
+            if not consumers or name in coverage.shared_fixtures:
+                return None
+            selected.update(consumers)
+            continue
+        if not name.startswith("sqlglot/") or not name.endswith(".py") or name not in coverage.lines:
             return None
         if name not in source_cache:
             try:
@@ -257,9 +286,9 @@ def select_tests(
         original = source_cache[name]
         if original is None or not patch_compiles(name, original.lines, edits):
             return None
-        collection_lines = collection.get(name, set())
+        collection_lines = coverage.collection.get(name, set())
         for edit in edits:
-            tests = impacted_tests(edit, by_file[name], original.bodies, collection_lines)
+            tests = impacted_tests(edit, coverage.lines[name], original.bodies, collection_lines)
             if not tests:
                 return None
             selected.update(tests)
@@ -300,17 +329,18 @@ def main() -> None:
     durations = {test["number"]: round(test["seconds"] * 1000) for test in catalog}
     test_numbers = set(durations)
     numbers_by_id = {test["id"]: test["number"] for test in catalog}
-    by_file, unmeasured, collection = read_coverage(args.coverage, numbers_by_id)
-    subprocess_files = {
-        path for path in {test["file"] for test in catalog} if uses_subprocesses(args.source / path)
-    }
-    unmeasured.update(test["number"] for test in catalog if test["file"] in subprocess_files)
+    coverage = read_coverage(args.coverage, numbers_by_id)
+    if not coverage.subprocess_coverage:
+        subprocess_files = {
+            path for path in {test["file"] for test in catalog} if uses_subprocesses(args.source / path)
+        }
+        coverage.unmeasured.update(test["number"] for test in catalog if test["file"] in subprocess_files)
 
     source_cache: dict[str, SourceFile | None] = {}
     full_schedule = schedule(durations.items())
     for path in sorted((args.data / "commits").glob("*.patch")):
         patch = path.read_text(encoding="utf-8", errors="surrogateescape")
-        selection = select_tests(patch, by_file, unmeasured, collection, args.source, source_cache)
+        selection = select_tests(patch, coverage, args.source, source_cache)
         workers = full_schedule
         if selection is not None and selection != test_numbers:
             workers = schedule((number, durations[number]) for number in selection)

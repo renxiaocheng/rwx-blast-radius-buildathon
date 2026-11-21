@@ -6,12 +6,14 @@ function bodies, keeps tests whose coverage is incomplete, and runs the full
 suite when it cannot identify an affected function safely. It chooses the
 worker count and grouping using the recorded test times and worker cost.
 
-The compressed coverage in `vendor/coverage.json.gz` was collected on Apple
-Silicon with Python 3.12 using `collect_coverage.py`. The map is based on the
-unmodified upstream tests. It includes test IDs to match the scorer's catalog.
+The compressed coverage in `vendor/coverage.json.gz` was collected in the
+contest's Linux/amd64 Python 3.13 image using `collect_coverage.py` and
+`coverage_worker.py`. The collector attributes work in spawned process pools
+to the test that submitted it. It also records which tests read individual SQL
+fixtures. Tests without complete traces are always selected. The map uses test
+IDs to match the scorer's catalog and is based on the unmodified upstream tests.
 The second archive in `vendor/` contains Python source from the pinned SQLGlot
-revision and its upstream license. The entry reads that source to identify
-function boundaries and test modules that may run code in child processes.
+revision and its upstream license.
 
 ## The problem
 

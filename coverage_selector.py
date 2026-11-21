@@ -8,17 +8,21 @@ import gzip
 import json
 from pathlib import Path, PurePosixPath
 import re
+from types import CodeType
 from typing import Iterable
 
+from attribute_witnesses import AttributeWitnesses
+from comparison_witnesses import ComparisonEvidence, comparison_changes, comparison_tests
+from condition_witnesses import equivalent_for, replacements
 from dialect_impact import DialectImpact
 from patch_impact import statement_impact
-from source_impact import changed_test_methods, comment_only, expression_arg_types_impact
+from source_impact import changed_test_methods, compiled_equivalent, expression_arg_types_impact
 
 
 HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*$")
 SOURCE_POSITION_NAMES = {
-    "__code__", "__traceback__", "co_code", "co_consts", "co_filename", "co_firstlineno",
-    "co_lnotab", "co_lines", "co_positions", "disassemble", "f_lineno", "getframeinfo",
+    "__code__", "__firstlineno__", "__traceback__", "co_code", "co_consts", "co_filename", "co_firstlineno",
+    "co_linetable", "co_lnotab", "co_lines", "co_positions", "disassemble", "f_lineno", "getframeinfo",
     "getsource", "getsourcefile", "getsourcelines", "linecache", "tb_lineno", "traceback",
 }
 
@@ -41,6 +45,7 @@ class FunctionBody:
 class SourceFile:
     lines: list[str]
     bodies: list[FunctionBody]
+    code: CodeType
 
 
 @dataclass
@@ -56,6 +61,7 @@ class CoverageIndex:
     source_reads: dict[str, set[int]]
     shared_source_reads: set[str]
     observes_source: bool
+    dedicated_importers: dict[str, set[int]]
 
 
 class TestSourceIndex:
@@ -85,6 +91,45 @@ class TestSourceIndex:
         if any(name not in self.by_method for name in names):
             return None
         return set().union(*(self.by_method[name] for name in names))
+
+
+class ExecutionWitnesses:
+    def __init__(self, path: Path, source: Path, numbers_by_id: dict[str, int]):
+        opener = gzip.open if path.suffix == ".gz" else open
+        with opener(path, "rt", encoding="utf-8") as stream:
+            data = json.load(stream)
+        self.numbers_by_id = numbers_by_id
+        self.ids_by_number = {number: node for node, number in numbers_by_id.items()}
+        self.reliable = set(data["reliable"])
+        self.unobserved = {
+            number for node, number in numbers_by_id.items() if node not in self.reliable
+        }
+        self.comparisons = ComparisonEvidence()
+        self.comparisons.merge(data.get("comparison_witnesses", ()))
+        self.conditions = data.get("condition_witnesses", {}).get("sites", {})
+        self.comparison_files = {site[0] for site in self.comparisons.by_site}
+        self.condition_files = {site.split(":", 1)[0] for site in self.conditions}
+        self.attributes = None
+        if "attribute_witnesses" in data:
+            self.attributes = AttributeWitnesses(source, data["attribute_witnesses"], numbers_by_id)
+
+    def expression_tests(self, name, lines, edits, candidates, source_readers):
+        eligible = {self.ids_by_number[number] for number in candidates - source_readers - self.unobserved}
+        if not eligible:
+            return candidates
+        sites = comparison_changes(name, lines, edits) if name in self.comparison_files else None
+        if sites:
+            required = comparison_tests(sites, eligible, self.comparisons)
+            if required is not None and required != eligible:
+                return candidates - {self.numbers_by_id[node] for node in eligible - required}
+        changes = replacements(name, lines, edits) if name in self.condition_files else ()
+        if changes and all(change.site in self.conditions for change in changes):
+            proven = {
+                node for node in eligible
+                if all(equivalent_for(change, self.conditions[change.site].get(node)) for change in changes)
+            }
+            return candidates - {self.numbers_by_id[node] for node in proven}
+        return candidates
 
 
 def parse_patch(patch: str) -> list[tuple[str, list[Edit]]] | None:
@@ -184,14 +229,23 @@ def read_coverage(path: Path, numbers_by_id: dict[str, int]) -> CoverageIndex:
         number_map = {str(number): number for number in test_numbers}
     by_line = defaultdict(lambda: defaultdict(set))
     measured_tests = set()
-    for number_text, files in coverage["coverage"].items():
-        number = number_map.get(number_text)
-        if number is None:
-            continue
-        measured_tests.add(number)
-        for filename, spans in files.items():
-            for line in covered_lines(spans):
-                by_line[filename][line].add(number)
+    if "line_test_sets" in coverage:
+        mapped = {int(number): target for number, target in number_map.items()}
+        measured_tests.update(mapped[number] for number in coverage["measured"] if number in mapped)
+        groups = [{mapped[number] for number in group if number in mapped} for group in coverage["line_test_sets"]]
+        by_line.update({
+            filename: {line: groups[group] for group, spans in entries for line in covered_lines(spans)}
+            for filename, entries in coverage["line_index"].items()
+        })
+    else:
+        for number_text, files in coverage["coverage"].items():
+            number = number_map.get(number_text)
+            if number is None:
+                continue
+            measured_tests.add(number)
+            for filename, spans in files.items():
+                for line in covered_lines(spans):
+                    by_line[filename][line].add(number)
 
     unknown = {
         number_map[str(number)] for number in coverage.get("unmeasured", []) if str(number) in number_map
@@ -205,6 +259,11 @@ def read_coverage(path: Path, numbers_by_id: dict[str, int]) -> CoverageIndex:
             name: {number_map[str(number)] for number in numbers if str(number) in number_map}
             for name, numbers in coverage.get(key, {}).items()
         }
+    recorded_import = coverage.get("lazy_import_evidence", {})
+    import_test = numbers_by_id.get(recorded_import.get("test_id"))
+    dedicated_importers = {
+        name: {import_test} for name in recorded_import.get("imported_files", ())
+    } if import_test is not None else {}
     return CoverageIndex(
         by_line,
         unmeasured_tests,
@@ -217,6 +276,7 @@ def read_coverage(path: Path, numbers_by_id: dict[str, int]) -> CoverageIndex:
         remap("source_reads"),
         set(coverage.get("shared_source_reads", [])),
         "source_reads" in coverage,
+        dedicated_importers,
     )
 
 
@@ -229,26 +289,25 @@ def read_source(path: Path) -> SourceFile:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
     bodies.sort(key=lambda body: body.end - body.start)
-    return SourceFile(source.splitlines(), bodies)
+    return SourceFile(source.splitlines(), bodies, compile(tree, str(path), "exec", dont_inherit=True))
 
 
-def patch_compiles(name: str, lines: list[str], edits: list[Edit]) -> bool:
+def compiled_patch(name: str, lines: list[str], edits: list[Edit]) -> tuple[list[str], CodeType] | None:
     patched = lines.copy()
     previous_start = len(lines) + 1
     for edit in reversed(edits):
         start = edit.start - 1
         end = start + len(edit.removed)
         if start < 0 or end > len(lines) or end > previous_start:
-            return False
+            return None
         if lines[start:end] != edit.removed:
-            return False
+            return None
         patched[start:end] = edit.added
         previous_start = start
     try:
-        compile("\n".join(patched) + "\n", name, "exec", dont_inherit=True)
-    except (SyntaxError, ValueError):
-        return False
-    return True
+        return patched, compile("\n".join(patched) + "\n", name, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError, RecursionError, OverflowError):
+        return None
 
 
 def uses_subprocesses(path: Path) -> bool:
@@ -355,6 +414,7 @@ def select_tests(
     source_cache: dict[str, SourceFile | None],
     dialects: DialectImpact | None = None,
     test_sources: TestSourceIndex | None = None,
+    witnesses: ExecutionWitnesses | None = None,
 ) -> set[int] | None:
     files = parse_patch(patch)
     if files is None:
@@ -378,7 +438,7 @@ def select_tests(
             except (OSError, SyntaxError, UnicodeError):
                 source_cache[name] = None
         original = source_cache[name]
-        if original is None or not patch_compiles(name, original.lines, edits):
+        if original is None or (compiled := compiled_patch(name, original.lines, edits)) is None:
             return None
         if name.startswith("tests/"):
             methods = changed_test_methods(name, original.lines, edits)
@@ -389,7 +449,10 @@ def select_tests(
                 return None
             selected.update(method_tests)
             continue
-        if coverage.observes_source and test_sources is not None and comment_only(name, original.lines, edits):
+        patched, code = compiled
+        if coverage.observes_source and test_sources is not None and compiled_equivalent(
+            original.lines, patched, edits, original.code, code,
+        ):
             if name in coverage.shared_source_reads:
                 return None
             selected.update(coverage.source_reads.get(name, set()))
@@ -397,9 +460,15 @@ def select_tests(
             continue
         if name not in coverage.lines:
             return None
+        source_readers = None
+        if witnesses is not None and coverage.observes_source and test_sources is not None:
+            if name not in coverage.shared_source_reads:
+                source_readers = coverage.source_reads.get(name, set()) | test_sources.mentioning(SOURCE_POSITION_NAMES)
         collection_lines = coverage.collection.get(name, set())
         narrowed = statement_tests(name, original.lines, edits, coverage.lines[name], collection_lines)
         if narrowed:
+            if source_readers is not None:
+                narrowed = witnesses.expression_tests(name, original.lines, edits, narrowed, source_readers)
             selected.update(narrowed)
             continue
         file_tests = set()
@@ -409,8 +478,19 @@ def select_tests(
                 break
             file_tests.update(tests)
         else:
+            if source_readers is not None:
+                file_tests = witnesses.expression_tests(name, original.lines, edits, file_tests, source_readers)
             selected.update(file_tests)
             continue
+        # The isolated import test may inspect class data created by module code.
+        selected.update(coverage.dedicated_importers.get(name, ()))
+        if source_readers is not None and witnesses.attributes is not None and dialects is not None:
+            reads = witnesses.attributes.select_patch(
+                name, original.lines, edits, dialect_targets=dialects.targets, mentions=test_sources.mentioning,
+            )
+            if reads is not None:
+                selected.update(reads, witnesses.unobserved, source_readers)
+                continue
         classes = expression_arg_types_impact(name, original.lines, edits)
         if classes and test_sources is not None:
             expression_tests = class_tests(classes, coverage, test_sources, source)
@@ -432,9 +512,18 @@ def select_tests(
 def schedule(tests: Iterable[tuple[int, int]]) -> list[list[int]]:
     """Balance work using the scorer's durations and per-worker overhead."""
     ordered = sorted(tests, key=lambda test: (-test[1], test[0]))
+    if not ordered:
+        return []
+    total = sum(milliseconds for _, milliseconds in ordered)
+    largest = ordered[0][1]
     best = []
     best_cost = float("inf")
     for count in range(1, min(len(ordered), 8) + 1):
+        overhead = 2000 * count
+        if largest + overhead >= best_cost:
+            break
+        if (total + count - 1) // count + overhead >= best_cost:
+            continue
         workers = [[] for _ in range(count)]
         loads = [0] * count
         for number, milliseconds in ordered:
@@ -442,7 +531,7 @@ def schedule(tests: Iterable[tuple[int, int]]) -> list[list[int]]:
             workers[worker].append(number)
             loads[worker] += milliseconds
 
-        cost = max(loads) + 2000 * count
+        cost = max(loads) + overhead
         if cost < best_cost:
             best, best_cost = workers, cost
     return best
@@ -453,6 +542,8 @@ def main() -> None:
     parser.add_argument("--data", type=Path, default=Path("/data"))
     parser.add_argument("--coverage", type=Path, required=True, help="Coverage map for the official test numbers")
     parser.add_argument("--source", type=Path, required=True, help="Checkout of the pinned SQLGlot revision")
+    parser.add_argument("--witnesses", type=Path, help="Runtime observations from the pinned SQLGlot revision")
+    parser.add_argument("--dialect-index", type=Path, help="Pinned source imports and test references")
     args = parser.parse_args()
     if not args.coverage.is_file():
         parser.error(f"coverage map not found: {args.coverage}")
@@ -464,6 +555,7 @@ def main() -> None:
     test_numbers = set(durations)
     numbers_by_id = {test["id"]: test["number"] for test in catalog}
     coverage = read_coverage(args.coverage, numbers_by_id)
+    witnesses = ExecutionWitnesses(args.witnesses, args.source, numbers_by_id) if args.witnesses else None
     if not coverage.subprocess_coverage:
         subprocess_files = {
             path for path in {test["file"] for test in catalog} if uses_subprocesses(args.source / path)
@@ -471,12 +563,12 @@ def main() -> None:
         coverage.unmeasured.update(test["number"] for test in catalog if test["file"] in subprocess_files)
 
     source_cache: dict[str, SourceFile | None] = {}
-    dialects = DialectImpact(args.source, coverage.lines, catalog)
+    dialects = DialectImpact(args.source, coverage.lines, catalog, index_path=args.dialect_index)
     test_sources = TestSourceIndex(args.source, catalog)
     full_schedule = schedule(durations.items())
     for path in sorted((args.data / "commits").glob("*.patch")):
         patch = path.read_text(encoding="utf-8", errors="surrogateescape")
-        selection = select_tests(patch, coverage, args.source, source_cache, dialects, test_sources)
+        selection = select_tests(patch, coverage, args.source, source_cache, dialects, test_sources, witnesses)
         workers = full_schedule
         if selection is not None and selection != test_numbers:
             workers = schedule((number, durations[number]) for number in selection)

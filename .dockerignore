@@ -5,7 +5,12 @@
 !dialect_impact.py
 !patch_impact.py
 !source_impact.py
+!attribute_witnesses.py
+!comparison_witnesses.py
+!condition_witnesses.py
 !vendor/
 vendor/*
 !vendor/coverage.json.gz
+!vendor/dialect-index.json.gz
+!vendor/witnesses.json.gz
 !vendor/sqlglot-eb11aec.tar.gz

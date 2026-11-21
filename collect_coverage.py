@@ -19,16 +19,17 @@ from weakref import WeakSet
 import coverage
 import pytest
 
-from coverage_worker import AuditTrace, WorkerTask, initialize_worker, run_task, trace_class_uses
+from attribute_witnesses import candidate_attribute_names
+from coverage_worker import AuditTrace, WorkerTask, initialize_worker, run_task, trace_observations
 
 
 class TestCoverage:
-    def __init__(self, tracer, numbers, source, directory):
+    def __init__(self, tracer, numbers, source, directory, witness_fields=(), important=()):
         self.tracer = tracer
         self.numbers = numbers
         self.source = source
         self.directory = Path(directory)
-        self.audit = AuditTrace(source)
+        self.audit = AuditTrace(source, witness_fields, important)
         self.passed = defaultdict(set)
         self.incomplete = set()
         self.traced_pools = WeakSet()
@@ -78,7 +79,8 @@ class TestCoverage:
                 else:
                     original_init(
                         executor, max_workers, mp_context, initialize_worker,
-                        (str(self.source), str(self.directory), payload), **options
+                        (str(self.source), str(self.directory), payload,
+                         self.audit.witness_fields, self.audit.important), **options
                     )
                     self.traced_pools.add(executor)
                     return
@@ -224,11 +226,14 @@ def main():
     parser.add_argument("--source", type=Path, required=True, help="Pinned SQLGlot checkout")
     parser.add_argument("--test-catalog", type=Path, required=True, help="Official tests.json")
     parser.add_argument("--output", type=Path, required=True, help="Per-test coverage JSON path")
+    parser.add_argument("--witnesses", action="store_true", help="Collect value and class-read witnesses")
     args = parser.parse_args()
     source = args.source.resolve()
     output = args.output.resolve()
     catalog = json.loads(args.test_catalog.read_text())["tests"]
     numbers = {entry["id"]: entry["number"] for entry in catalog}
+    witness_fields = candidate_attribute_names(source) if args.witnesses else ()
+    important = {entry["id"] for entry in catalog if entry["seconds"] >= 0.1} if args.witnesses else ()
 
     os.chdir(source)
     os.environ["SKIP_INTEGRATION"] = "0"
@@ -237,8 +242,8 @@ def main():
         config_file=False, data_file=None, source=[str(source / "sqlglot")]
     )
     with TemporaryDirectory(prefix="sqlglot-worker-coverage-") as workers:
-        collector = TestCoverage(tracer, numbers, source, workers)
-        with tracer.collect(), collector.subprocess_tracing(), trace_class_uses(collector.audit):
+        collector = TestCoverage(tracer, numbers, source, workers, witness_fields, important)
+        with tracer.collect(), collector.subprocess_tracing(), trace_observations(collector.audit):
             status = pytest.main(
                 ["-q", "--continue-on-collection-errors", "-p", "no:cacheprovider", "tests"],
                 plugins=[collector],

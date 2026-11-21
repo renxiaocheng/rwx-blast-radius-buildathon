@@ -14,13 +14,22 @@ from uuid import uuid4
 
 import coverage
 
+from attribute_witnesses import AttributeRecorder, dynamic_instrumentation, mark_preloaded_modules
+from comparison_witnesses import ComparisonEvidence, trace_witnesses
+from condition_witnesses import ConditionRecorder, PROBE
+
 
 PROCESS_EVENTS = {"subprocess.Popen", "os.system", "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty", "os.exec"}
 
 
 class AuditTrace:
-    def __init__(self, source):
+    def __init__(self, source, witness_fields=(), important=()):
         self.source = str(source) + os.sep
+        self.witness_fields = tuple(witness_fields)
+        self.important = frozenset(important)
+        self.comparisons = ComparisonEvidence()
+        self.attributes = AttributeRecorder()
+        self.conditions = ConditionRecorder(self, important)
         self.fixture_root = self.source + os.path.join("tests", "fixtures") + os.sep
         self.active = False
         self.node_id = None
@@ -34,6 +43,26 @@ class AuditTrace:
         self._classes_by_context = defaultdict(set)
         self.unknown_tests = set()
         self.unknown_shared = False
+
+    def current_test(self):
+        return self.node_id if self.in_call else None
+
+    def wants_comparison(self):
+        return self.active and (not self.in_call or self.node_id in self.important)
+
+    def register_comparison_site(self, path, line, column, op):
+        self.comparisons.register(path, line, column, op)
+
+    def record_comparison(self, path, line, column, op, sample):
+        if self.wants_comparison():
+            self.comparisons.observe(self.current_test(), path, line, column, op, sample)
+
+    def register_attribute_site(self, path, line, field):
+        self.attributes.register_site(path, line, field)
+
+    def record_attribute(self, receiver, field, path, line):
+        if self.active:
+            self.attributes.record(receiver, field, path, line, self.current_test())
 
     def record_process(self):
         if self.node_id is not None:
@@ -100,6 +129,9 @@ class AuditTrace:
             "shared_class_uses": sorted(self.shared_class_uses),
             "source_reads": {path: sorted(nodes) for path, nodes in self.source_reads.items()},
             "shared_source_reads": sorted(self.shared_source_reads),
+            "comparison_witnesses": self.comparisons.export(),
+            "attribute_witnesses": self.attributes.export(),
+            "condition_witnesses": self.conditions.export(),
         }
 
     def merge_observations(self, data):
@@ -109,6 +141,32 @@ class AuditTrace:
         for name, nodes in data.get("source_reads", {}).items():
             self.source_reads[name].update(nodes)
         self.shared_source_reads.update(data.get("shared_source_reads", []))
+        self.comparisons.merge(data.get("comparison_witnesses", ()))
+        if "attribute_witnesses" in data:
+            self.attributes.merge(data["attribute_witnesses"])
+        self.conditions.merge(data.get("condition_witnesses", {}))
+
+
+@contextmanager
+def trace_observations(audit):
+    if not audit.witness_fields and not audit.important:
+        with trace_class_uses(audit):
+            yield
+        return
+    source = Path(audit.source)
+    mark_preloaded_modules(source, audit.attributes)
+    attributes, helpers = dynamic_instrumentation(audit.attributes, audit.current_test)
+    helpers[PROBE] = audit.conditions
+
+    def transform(path, tree):
+        tree = audit.conditions.transform(path, tree)
+        return attributes(path, tree)
+
+    with trace_witnesses(
+        source, audit, attribute_names=audit.witness_fields,
+        extra_transformer=transform, extra_helpers=helpers,
+    ), trace_class_uses(audit):
+        yield
 
 
 @contextmanager
@@ -162,12 +220,12 @@ class WorkerTask:
 
 
 class WorkerTrace:
-    def __init__(self, source, directory):
+    def __init__(self, source, directory, witness_fields, important):
         self.base = Path(directory) / f"worker-{os.getpid()}-{uuid4().hex}"
         self.tracer = coverage.Coverage(
             config_file=False, data_file=str(self.base.with_suffix(".cov")), source=[str(Path(source) / "sqlglot")]
         )
-        self.audit = AuditTrace(source)
+        self.audit = AuditTrace(source, witness_fields, important)
         self.task_ids = []
         self.tracer.start()
         sys.addaudithook(self.audit.audit)
@@ -191,10 +249,10 @@ class WorkerTrace:
 _worker_trace = None
 
 
-def initialize_worker(source, directory, encoded_initializer):
+def initialize_worker(source, directory, encoded_initializer, witness_fields=(), important=()):
     global _worker_trace
-    _worker_trace = WorkerTrace(source, directory)
-    tracing = trace_class_uses(_worker_trace.audit)
+    _worker_trace = WorkerTrace(source, directory, witness_fields, important)
+    tracing = trace_observations(_worker_trace.audit)
     tracing.__enter__()
     Finalize(None, tracing.__exit__, (None, None, None), exitpriority=-1)
     original_start = BaseProcess.start

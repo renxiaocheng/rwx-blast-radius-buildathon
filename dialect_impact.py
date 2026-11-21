@@ -1,15 +1,20 @@
 """Conservative test selection for pinned SQLGlot dialect data assignments."""
 
+import argparse
 import ast
 from collections import defaultdict
+import gzip
+import hashlib
 from importlib.util import resolve_name
 from io import StringIO
+import json
 from pathlib import Path, PurePosixPath
 import tokenize
 from typing import Callable, Iterable, Protocol
 
 
 _FAMILY_PACKAGES = {"dialects", "parsers", "generators", "tokenizers", "typing"}
+_INDEX_VERSION = 1
 _REGISTRY_NAMES = {
     "Dialects",
     "DIALECT_MODULE_NAMES",
@@ -290,12 +295,19 @@ def _data_changes(
             return set()
         patched[start:end] = edit.added
 
+    old_assignments = _assignments(tree.body)
+    assignment_ranges = [(node.lineno, node.end_lineno) for node in old_assignments.values() if node is not None]
+    if not all(
+        any(first <= line <= last for first, last in assignment_ranges)
+        for edit in edits for line in range(edit.start, edit.start + len(edit.removed))
+    ):
+        return set()
+
     amended_source = "\n".join(patched) + "\n"
     try:
         amended = ast.parse(amended_source)
     except (SyntaxError, ValueError):
         return set()
-    old_assignments = _assignments(tree.body)
     new_assignments = _assignments(amended.body)
     fields = set()
     modified_ranges = []
@@ -340,46 +352,124 @@ def _data_changes(
 
 
 class DialectImpact:
-    def __init__(self, source: Path, coverage_lines: dict[str, dict[int, set[int]]], catalog: Iterable[dict]):
+    def __init__(
+        self,
+        source: Path,
+        coverage_lines: dict[str, dict[int, set[int]]],
+        catalog: Iterable[dict],
+        *,
+        index_path: Path | None = None,
+    ):
         self.source = source
         self.coverage_lines = coverage_lines
         self.catalog = tuple(catalog)
+        self.index_path = index_path
         self.dialects = {
             path.stem for path in (source / "sqlglot" / "dialects").glob("*.py")
             if path.stem not in {"__init__", "dialect"}
         }
-        self.trees = None
+        self._trees: dict[str, ast.Module | None] = {}
+        self._indexed = False
         self.family_tests = {}
         self.field_tests = {}
 
-    def _load(self):
+    def _paths(self) -> set[str]:
         paths = {path.relative_to(self.source).as_posix() for path in (self.source / "sqlglot").rglob("*.py")}
         paths.update(test["file"] for test in self.catalog)
-        try:
-            self.trees = {
-                name: ast.parse((self.source / name).read_bytes(), filename=name)
-                for name in sorted(paths)
-            }
-        except (OSError, SyntaxError, ValueError):
-            self.trees = {}
-        self.modules = {_module_name(path): tree for path, tree in self.trees.items()}
-        self.import_points = {
-            path: [
-                (node.lineno, _imports(path, (node,)))
+        return paths
+
+    def _tree(self, path: str) -> ast.Module | None:
+        if path not in self._trees:
+            try:
+                self._trees[path] = ast.parse((self.source / path).read_bytes(), filename=path)
+            except (OSError, SyntaxError, ValueError):
+                self._trees[path] = None
+        return self._trees[path]
+
+    def _source_digests(self, paths: set[str]) -> dict[str, str]:
+        return {name: hashlib.sha256((self.source / name).read_bytes()).hexdigest() for name in sorted(paths)}
+
+    def build_index(self) -> dict:
+        """Collect static facts from the pinned source and catalog test files."""
+        paths = self._paths()
+        trees = {name: self._tree(name) for name in sorted(paths)}
+        if not all(tree is not None for tree in trees.values()):
+            raise ValueError("Could not parse every pinned module and catalog test file")
+
+        fields = {
+            assignment[-1]
+            for path, tree in trees.items()
+            if _family(path, self.dialects) is not None
+            for assignment in _assignments(tree.body)
+        }
+
+        def relevant(references: set[str]) -> list[str]:
+            return sorted(
+                name for name in references
+                if name in fields or name in _REGISTRY_NAMES or name.startswith("sqlglot.")
+                or name.casefold().partition(",")[0].strip() in self.dialects
+            )
+
+        import_points = {}
+        surfaces = {}
+        field_lines = defaultdict(lambda: defaultdict(set))
+        for path, tree in trees.items():
+            import_points[path] = [
+                [node.lineno, sorted(_imports(path, (node,)))]
                 for node in ast.walk(tree)
                 if isinstance(node, (ast.Import, ast.ImportFrom))
             ]
-            for path, tree in self.trees.items()
+            if path.startswith("tests/"):
+                shared, methods = _test_surfaces(path, tree)
+                surfaces[path] = [relevant(shared), {name: relevant(refs) for name, refs in methods.items()}]
+                continue
+            for node in ast.walk(tree):
+                name = _read_name(node)
+                if name in fields:
+                    field_lines[name][path].update(range(node.lineno, node.end_lineno + 1))
+
+        return {
+            "version": _INDEX_VERSION,
+            "source": self._source_digests(paths),
+            "imports": import_points,
+            "test_surfaces": surfaces,
+            "field_lines": {
+                field: {path: sorted(lines) for path, lines in by_file.items()}
+                for field, by_file in field_lines.items()
+            },
         }
+
+    def _index_data(self) -> dict:
+        if self.index_path is not None:
+            opener = gzip.open if self.index_path.suffix == ".gz" else open
+            try:
+                with opener(self.index_path, "rt", encoding="utf-8") as stream:
+                    index = json.load(stream)
+                if (
+                    index.get("version") == _INDEX_VERSION
+                    and all(isinstance(index.get(key), dict) for key in ("imports", "test_surfaces", "field_lines"))
+                    and index.get("source") == self._source_digests(self._paths())
+                ):
+                    return index
+            except (OSError, ValueError, AttributeError):
+                pass
+        try:
+            return self.build_index()
+        except (OSError, ValueError):
+            return {"imports": {}, "test_surfaces": {}, "field_lines": {}}
+
+    def _load(self) -> None:
+        if self._indexed:
+            return
+        self._indexed = True
+        index = self._index_data()
+        self.import_points = index["imports"]
+        self.field_lines = index["field_lines"]
         self.imports = {
             path: set().union(*(imports for _, imports in points))
             for path, points in self.import_points.items()
         }
-        surfaces = {
-            path: _test_surfaces(path, tree)
-            for path, tree in self.trees.items()
-            if path.startswith("tests/")
-        }
+        surfaces = index["test_surfaces"]
         self.test_references = {}
         for test in self.catalog:
             if test["file"] not in surfaces:
@@ -389,11 +479,11 @@ class DialectImpact:
             references = methods.get(name)
             if references is None:
                 references = set().union(*methods.values())
-            self.test_references[test["number"]] = shared | references
+            self.test_references[test["number"]] = set(shared).union(references)
 
     def _tests_for_family(self, family: str) -> set[int]:
         modules_by_family = defaultdict(set)
-        for path in self.trees:
+        for path in self.import_points:
             current = _family(path, self.dialects)
             if current is not None:
                 modules_by_family[current].add(path)
@@ -453,19 +543,17 @@ class DialectImpact:
     def _tests_for_field(self, field: str) -> set[int]:
         if field not in self.field_tests:
             users = self._static_readers(field)
-            for path, tree in self.trees.items():
-                if path.startswith("tests/"):
-                    continue
+            for path, positions in self.field_lines.get(field, {}).items():
                 lines = self.coverage_lines.get(path, {})
-                for node in ast.walk(tree):
-                    if _read_name(node) == field:
-                        for line in range(node.lineno, node.end_lineno + 1):
-                            users.update(lines.get(line, ()))
+                for line in positions:
+                    users.update(lines.get(line, ()))
             self.field_tests[field] = users
         return self.field_tests[field]
 
     def _factory_is_deferred(self, path: str, name: str, before: int) -> bool:
-        module = self.trees[path]
+        module = self._tree(path)
+        if module is None:
+            return False
         binding = _factory_binding(module, name)
         if binding is None or binding.lineno >= before:
             return False
@@ -480,7 +568,10 @@ class DialectImpact:
                     imported = resolve_name("." * binding.level + imported, package)
                 except ImportError:
                     return False
-            module = self.modules.get(imported)
+            if imported != "sqlglot" and not imported.startswith("sqlglot."):
+                return False
+            relative = imported.replace(".", "/")
+            module = self._tree(f"{relative}/__init__.py") or self._tree(f"{relative}.py")
             if module is None:
                 return False
             binding = _factory_binding(module, aliases[0].name)
@@ -491,9 +582,7 @@ class DialectImpact:
     ) -> set[tuple[str | None, str]]:
         if _family(path, self.dialects) is None:
             return set()
-        if self.trees is None:
-            self._load()
-        tree = self.trees.get(path)
+        tree = self._tree(path)
         if tree is None:
             return set()
         return {
@@ -515,6 +604,7 @@ class DialectImpact:
         targets = self.targets(path, original_lines, edits)
         if not targets:
             return None
+        self._load()
         family = _family(path, self.dialects)
         if family not in self.family_tests:
             self.family_tests[family] = self._tests_for_family(family)
@@ -528,3 +618,21 @@ class DialectImpact:
             else:
                 users.update(self._tests_for_field(field))
         return users
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Index pinned SQLGlot dialect source and catalog test references")
+    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--test-catalog", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    catalog = json.loads(args.test_catalog.read_text(encoding="utf-8"))["tests"]
+    index = DialectImpact(args.source, {}, catalog).build_index()
+    serialized = json.dumps(index, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    if args.output.suffix == ".gz":
+        serialized = gzip.compress(serialized, mtime=0)
+    args.output.write_bytes(serialized)
+
+
+if __name__ == "__main__":
+    main()

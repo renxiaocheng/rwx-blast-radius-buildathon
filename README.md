@@ -3,10 +3,11 @@
 This entry selects tests using per-test line coverage collected on SQLGlot at
 `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. It maps changed Python statements,
 static dialect configuration, and SQL fixtures to baseline test observations.
-For source-only edits it also considers source readers and tests that inspect
-Python code locations. It keeps tests whose coverage is incomplete and uses
-the full suite when the available evidence cannot bound an edit. Worker count
-and grouping use the recorded test times and per-worker overhead.
+It compares compiled code for behavior-preserving edits and retains observed
+source readers and tests that inspect Python code locations. It keeps tests
+whose coverage is incomplete and uses the full suite when the available
+evidence cannot bound an edit. Worker count and grouping use the recorded test
+times and per-worker overhead.
 
 The compressed coverage in `vendor/coverage.json.gz` was collected in the
 contest's Linux/amd64 Python 3.13 image using `collect_coverage.py` and
@@ -14,10 +15,24 @@ contest's Linux/amd64 Python 3.13 image using `collect_coverage.py` and
 to the test that submitted it and records fixture reads, explicit Python-source
 reads, and SQLGlot class use. Three optimizer tests that hit a DuckDB error
 under x86 emulation were re-traced with the same dependency versions in a native
-Linux/arm64 container. The map uses test IDs to match the scorer's catalog and
-is based on the unmodified upstream tests.
-The second archive in `vendor/` contains Python source from the pinned SQLGlot
-revision and its upstream license.
+Linux/arm64 container. A separate Linux/amd64 replay traced the fresh Python
+process launched by the lazy-import test. The compressed line index preserves
+those test memberships and uses test IDs to match the scorer's catalog.
+`vendor/dialect-index.json.gz` stores source imports, field access locations,
+and references from the pinned tests. `vendor/witnesses.json.gz` stores raw
+comparison operands, guard inputs, and class field reads from the same pinned
+tests. The selector checks a received patch against these observations. Shared
+observations, unsupported values, and incomplete traces preserve the safe
+fallback. The source archive contains the pinned Python source and its upstream
+license. All lookup data comes from the unmodified upstream source and tests.
+
+For regeneration, `collect_coverage.py` accepts the pinned checkout and the
+official test catalog. `capture_lazy_import.py` and `merge_lazy_import.py` record
+and merge the isolated child's observations. `pack_coverage.py` converts the
+merged coverage into the compressed line index. Run `dialect_impact.py --help`
+for the static index generator. Run `collect_coverage.py --witnesses` and pass
+the reports and pinned `--source` to `pack_witnesses.py` to regenerate the
+runtime profile and its static field access index.
 
 ## The problem
 

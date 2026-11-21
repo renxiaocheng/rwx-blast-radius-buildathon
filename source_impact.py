@@ -4,9 +4,11 @@ import ast
 from collections.abc import Iterable, Sequence
 from importlib.util import resolve_name
 from io import StringIO
+import marshal
 from pathlib import PurePosixPath
 import re
 import tokenize
+from types import CodeType
 
 from patch_impact import Changes, MaskedExpression, PatchEdit, apply_edits, statement_impact
 
@@ -24,7 +26,22 @@ def source_directive(line: str) -> bool:
     return line.startswith(("#!", "\ufeff")) or ENCODING.match(line) is not None
 
 
-def without_comment_tokens(source: str) -> tuple[tuple[int, str], ...]:
+def code_signature(code: CodeType) -> tuple:
+    # Format 2 keeps binary numbers and omits reference tags that depend on the
+    # runtime's string interning and current reference counts.
+    constants = tuple(
+        code_signature(value) if isinstance(value, CodeType) else (type(value), marshal.dumps(value, 2))
+        for value in code.co_consts
+    )
+    return (
+        code.co_name, code.co_qualname, code.co_argcount, code.co_posonlyargcount,
+        code.co_kwonlyargcount, code.co_nlocals, code.co_stacksize, code.co_flags,
+        code.co_code, code.co_exceptiontable, code.co_names, code.co_varnames,
+        code.co_cellvars, code.co_freevars, constants,
+    )
+
+
+def comment_tokens(source: str) -> tuple[tuple[int, str], ...]:
     return tuple(
         (token.type, token.string)
         for token in tokenize.generate_tokens(StringIO(source).readline)
@@ -32,30 +49,29 @@ def without_comment_tokens(source: str) -> tuple[tuple[int, str], ...]:
     )
 
 
-def comment_only(name: str, lines: Sequence[str], edits: Iterable[PatchEdit]) -> bool:
-    """Recognize comment and blank-line edits without claiming they are harmless."""
-    edits = tuple(edits)
+def compiled_equivalent(
+    lines: Sequence[str], patched: Sequence[str], edits: Sequence[PatchEdit], old: CodeType, new: CodeType,
+) -> bool:
+    """Compare executable code and constants, leaving source locations to observers."""
     if any(source_directive(line) for edit in edits for line in (*edit.removed, *edit.added)):
         return False
-    result = apply_edits(lines, edits)
-    if result is None:
+    old_header = [(i, line) for i, line in enumerate(lines[:2]) if source_directive(line)]
+    new_header = [(i, line) for i, line in enumerate(patched[:2]) if source_directive(line)]
+    if old_header != new_header:
         return False
-    patched, _, _ = result
-    if list(lines) == patched:
-        return False
-    old_directives = [(index, line) for index, line in enumerate(lines[:2]) if source_directive(line)]
-    new_directives = [(index, line) for index, line in enumerate(patched[:2]) if source_directive(line)]
-    if old_directives != new_directives:
-        return False
-    original_text = "\n".join(lines) + "\n"
-    patched_text = "\n".join(patched) + "\n"
     try:
-        if without_comment_tokens(original_text) != without_comment_tokens(patched_text):
+        if code_signature(old) == code_signature(new):
+            return True
+        # Python 3.13 stores a class's __firstlineno__ in its constants.
+        # A comment can shift this metadata and is handled by source-reader checks.
+        if not any(not line.strip() or "#" in line for edit in edits for line in (*edit.removed, *edit.added)):
             return False
-        original = ast.parse(original_text, name, type_comments=True)
-        modified = ast.parse(patched_text, name, type_comments=True)
-        return ast.dump(original) == ast.dump(modified)
-    except (SyntaxError, ValueError, RecursionError, tokenize.TokenError):
+        before = "\n".join(lines) + "\n"
+        after = "\n".join(patched) + "\n"
+        return comment_tokens(before) == comment_tokens(after) and ast.dump(
+            ast.parse(before, type_comments=True),
+        ) == ast.dump(ast.parse(after, type_comments=True))
+    except (SyntaxError, TypeError, ValueError, RecursionError, OverflowError, tokenize.TokenError):
         return False
 
 

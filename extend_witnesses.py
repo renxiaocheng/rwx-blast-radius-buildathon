@@ -7,9 +7,12 @@ from pathlib import Path
 
 from comparison_witnesses import ComparisonEvidence, unpack_comparison_row
 from branch_witnesses import BranchEvidence
+from coverage_selector import TestSourceIndex
+from dialect_impact import _module_name
 from generator_impact import GeneratorRecorder
+from mapping_impact import MappingImpact, declarations
 from mapping_witnesses import MappingRecorder, MappingWitnesses
-from shared_mapping_witnesses import ModuleMappingRecorder
+from shared_mapping_witnesses import ModuleMappingRecorder, ModuleMappingWitnesses, namespace_source_digest
 from tokenizer_impact import TokenizerEvidence
 
 
@@ -100,10 +103,37 @@ def supplement_generators(profile: dict, reports: list[Path]) -> None:
     profile["generator_complete"] = sorted(complete)
 
 
-def supplement_impact(profile: dict, reports: list[Path]) -> None:
+def pack_namespace_readers(profile: dict, source: Path, numbers_by_id: dict[str, int]) -> None:
+    """Precompute namespace observers of fields declared by unmodified SQLGlot."""
+    payload = profile["module_mapping_witnesses"]
+    witnesses = ModuleMappingWitnesses(source, payload, numbers_by_id)
+    index = TestSourceIndex(source, [
+        {"id": node, "number": number, "file": node.partition("::")[0]}
+        for node, number in numbers_by_id.items()
+    ])
+    ids_by_number = {number: node for node, number in numbers_by_id.items()}
+    impact = MappingImpact(source)
+    observed = {origin for origin, *_ in profile["mapping_witnesses"]["reads"]}
+    readers = {}
+    for file in (source / "sqlglot").rglob("*.py"):
+        path = file.relative_to(source).as_posix()
+        module = _module_name(path)
+        tree = impact._tree(path)
+        if tree is None:
+            raise ValueError(f"Cannot read pinned source {path}")
+        for origin in declarations(tree, module).keys() & observed:
+            receiver, _, field = origin.rpartition(".")
+            if receiver == module:
+                tests = witnesses.select(path, module, field, tree_for=impact._tree, mentions=index.mentioning)
+                readers[origin] = None if tests is None else sorted(ids_by_number[number] for number in tests)
+    payload["reader_census"] = {"source_digest": namespace_source_digest(source), "readers": readers}
+
+
+def supplement_impact(profile: dict, reports: list[Path], source: Path | None = None) -> None:
     branches = BranchEvidence()
     namespaces = ModuleMappingRecorder()
     complete = set()
+    numbers_by_id = {}
     for path in reports:
         report = load_profile(path)
         if report.get("witness_mode") != "impact":
@@ -111,10 +141,15 @@ def supplement_impact(profile: dict, reports: list[Path]) -> None:
         complete.update(completed_tests(report))
         branches.merge(report["branch_witnesses"])
         namespaces.merge(report["module_mapping_witnesses"])
+        for number, node in report["test_ids"].items():
+            if numbers_by_id.setdefault(node, int(number)) != int(number):
+                raise ValueError(f"Inconsistent catalog numbers in {path}")
     profile["branch_witnesses"] = branches.export()
     profile["branch_complete"] = sorted(complete)
     profile["module_mapping_witnesses"] = namespaces.export()
     profile["module_mapping_witnesses"]["reliable"] = sorted(complete)
+    if source is not None:
+        pack_namespace_readers(profile, source, numbers_by_id)
 
 
 def main():
@@ -128,7 +163,7 @@ def main():
     parser.add_argument("--generator", type=Path, nargs="+", default=[])
     parser.add_argument("--impact", type=Path, nargs="+", default=[])
     parser.add_argument("--compact-comparisons", action="store_true", help="Store comparison test IDs once")
-    parser.add_argument("--source", type=Path, help="Pinned source for the mapping site census")
+    parser.add_argument("--source", type=Path, help="Pinned source for mapping and namespace censuses")
     args = parser.parse_args()
     profile = load_profile(args.baseline)
     if args.comparisons:
@@ -142,7 +177,7 @@ def main():
     if args.generator:
         supplement_generators(profile, args.generator)
     if args.impact:
-        supplement_impact(profile, args.impact)
+        supplement_impact(profile, args.impact, args.source)
     if args.compact_comparisons:
         compact_comparisons(profile)
     with args.output.open("wb") as stream:

@@ -5,13 +5,14 @@ import builtins
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import hashlib
 import inspect
 from importlib.util import resolve_name
 from pathlib import Path
 import types
 
 from attribute_witnesses import _METHOD_ACCESS, _dictionary_field, _literal_name, _local_binding, _name
-from dialect_impact import _module_name as source_module
+from dialect_impact import _factory_binding, _module_name as source_module
 
 
 _VERSION = 1
@@ -29,6 +30,15 @@ _CODE = {"eval": builtins.eval, "exec": builtins.exec}
 _FUNCTIONS = _BUILTINS | _INSPECT | _CODE
 _CALL_NAMES = set(_FUNCTIONS) | _METHOD_ACCESS | _LOCAL | {"attrgetter"}
 Site = tuple[str, int, int, str]
+
+
+def namespace_source_digest(source: Path) -> str:
+    digest = hashlib.sha256()
+    for package in ("sqlglot", "tests"):
+        for path in sorted((source / package).rglob("*.py")):
+            digest.update(path.relative_to(source).as_posix().encode("utf-8") + b"\0")
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -227,19 +237,82 @@ def module_mapping_instrumentation(source: Path, recorder: ModuleMappingRecorder
     return transform, {_CALL: invoke, _ATTR: attribute, _CODE_FUNCTION: code_function}
 
 
+def _plain_helper(tree, statement, relevant):
+    if (
+        not isinstance(statement, ast.FunctionDef) or statement.decorator_list or getattr(statement, "type_params", ())
+        or _factory_binding(tree, statement.name) is not statement
+    ):
+        return False
+    body = {node for item in statement.body for node in ast.walk(item)}
+    return bool(body & relevant) and not (set(ast.walk(statement)) - body) & relevant
+
+
+def _stdlib_test_class(tree, owner):
+    if owner not in tree.body or owner.decorator_list or owner.keywords or len(owner.bases) != 1:
+        return False
+    base = owner.bases[0]
+    if not isinstance(base, ast.Attribute) or base.attr != "TestCase" or not isinstance(base.value, ast.Name):
+        return False
+    name = base.value.id
+    bindings = [
+        (node, alias) for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names if (alias.asname or alias.name.partition(".")[0]) == name or alias.name == "*"
+    ]
+    if len(bindings) != 1:
+        return False
+    statement, alias = bindings[0]
+    if (
+        not isinstance(statement, ast.Import) or statement not in tree.body or statement.lineno >= owner.lineno
+        or alias.name != "unittest"
+    ):
+        return False
+    return not any(
+        isinstance(node, ast.Name) and node.id == name and not isinstance(node.ctx, ast.Load)
+        or isinstance(node, ast.arg) and node.arg == name
+        or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler,
+                             ast.MatchAs, ast.MatchStar)) and node.name == name
+        or isinstance(node, ast.MatchMapping) and node.rest == name
+        or isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names
+        for node in ast.walk(tree)
+    )
+
+
+def _ordinary_test(tree, method):
+    if not isinstance(method, ast.FunctionDef) or not method.name.startswith("test_"):
+        return False
+    for decorator in method.decorator_list:
+        if (
+            not isinstance(decorator, ast.Call) or not isinstance(decorator.func, ast.Name)
+            or len(decorator.args) != 1 or decorator.keywords or _literal_name(decorator.args[0]) is None
+        ):
+            return False
+        binding = _factory_binding(tree, decorator.func.id)
+        if (
+            not isinstance(binding, ast.ImportFrom) or binding.module != "unittest.mock" or binding.level
+            or binding.lineno >= decorator.lineno
+            or not any((alias.asname or alias.name) == decorator.func.id and alias.name == "patch" for alias in binding.names)
+        ):
+            return False
+    return True
+
+
 class ModuleMappingWitnesses:
     def __init__(self, source: Path, payload: Mapping, numbers_by_id: Mapping[str, int]):
         self.source = source
         self.numbers_by_id = numbers_by_id
         self.files = defaultdict(set)
+        self.methods = defaultdict(set)
         for node, number in numbers_by_id.items():
             self.files[node.partition("::")[0]].add(number)
+            self.methods[node.split("[", 1)[0]].add(number)
         self.recorded = ModuleMappingRecorder()
         self.recorded.merge(payload)
         reliable = payload.get("reliable")
         self.unobserved = None if not isinstance(reliable, list) else set(numbers_by_id.values()) - {
             numbers_by_id[node] for node in reliable if node in numbers_by_id
         }
+        self.reader_census = payload.get("reader_census")
+        self.census_verified = None
         self.census = None
 
     def _load(self, tree_for):
@@ -285,9 +358,81 @@ class ModuleMappingWitnesses:
             names.add(statement.name)
         return names
 
+    def _scoped_helpers(self, path, tree, helper_exports, exposed, mentions):
+        nodes = tuple(ast.walk(tree))
+        parents = {child: node for node in nodes for child in ast.iter_child_nodes(node)}
+        imports = set()
+        for statement in tree.body:
+            if not isinstance(statement, ast.ImportFrom) or statement.level:
+                continue
+            for alias in statement.names:
+                name = alias.asname or alias.name
+                if (
+                    name in exposed and (statement.module, alias.name) in helper_exports
+                    and _factory_binding(tree, name) is statement
+                ):
+                    imports.add(name)
+        if not imports:
+            return None
+        if any(
+            isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr in imports
+            or isinstance(node, ast.Constant) and type(node.value) is str and node.value in imports
+            for node in nodes
+        ):
+            return None
+
+        callers = set()
+        owners = set()
+        methods = set()
+        declarations = set()
+        for node in nodes:
+            if not isinstance(node, ast.Name) or not isinstance(node.ctx, ast.Load) or node.id not in imports:
+                continue
+            call = parents.get(node)
+            if not isinstance(call, ast.Call) or call.func is not node:
+                return None
+            body = call
+            method = parents.get(body)
+            while method is not None and not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if isinstance(method, (ast.ClassDef, ast.Lambda)):
+                    return None
+                body, method = method, parents.get(method)
+            if not _ordinary_test(tree, method) or body not in method.body:
+                return None
+            owner = parents.get(method)
+            if owner is tree:
+                qualified = f"{path}::{method.name}"
+            elif isinstance(owner, ast.ClassDef) and _stdlib_test_class(tree, owner):
+                qualified = f"{path}::{owner.name}::{method.name}"
+                owners.add(owner.name)
+                declarations.add(owner)
+            else:
+                return None
+            matched = self.methods.get(qualified)
+            if not matched:
+                return None
+            callers.update(matched)
+            methods.add(method.name)
+            declarations.add(method)
+        local = self.files[path]
+        visible = owners | methods
+        if not callers or mentions(visible) - local or mentions(exposed - imports - visible) & local:
+            return None
+        if any(
+            isinstance(node, (ast.Name, ast.Attribute)) and _name(node) in visible
+            or isinstance(node, ast.Constant) and type(node.value) is str and node.value in visible
+            or isinstance(node, ast.alias) and node.name in visible
+            or isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in visible
+            and node not in declarations
+            for node in nodes
+        ):
+            return None
+        return callers
+
     def _test_readers(self, module, field, census, mentions):
         result = set()
         exposed = set()
+        helpers = set()
         support = []
         for path, (tree, accesses) in census.items():
             if not path.startswith("tests/"):
@@ -310,10 +455,15 @@ class ModuleMappingWitnesses:
             if names is None:
                 return None
             exposed.update(names)
-            support.append(tree)
+            if path not in self.files:
+                helpers.update(
+                    (source_module(path), statement.name) for statement in tree.body
+                    if _plain_helper(tree, statement, relevant | direct)
+                )
+            support.append((path, tree, accesses))
         while exposed:
             previous = set(exposed)
-            for tree in support:
+            for _, tree, _ in support:
                 references = {
                     node for node in ast.walk(tree)
                     if (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in exposed)
@@ -332,12 +482,33 @@ class ModuleMappingWitnesses:
                 exposed.update(names)
             if exposed == previous:
                 break
-        result.update(mentions(exposed))
+        protected = mentions(exposed)
+        for path, tree, accesses in support:
+            local = self.files.get(path)
+            if not local or not protected & local or result & local or accesses:
+                continue
+            callers = self._scoped_helpers(path, tree, helpers, exposed, mentions)
+            if callers is not None:
+                protected.difference_update(local)
+                protected.update(callers)
+        result.update(protected)
         return result
 
     def select(self, path: str, module: str, field: str, *, tree_for, mentions) -> set[int] | None:
         if self.recorded.unresolved or self.unobserved is None:
             return None
+        if self.reader_census is not None:
+            if self.census_verified is None:
+                try:
+                    self.census_verified = namespace_source_digest(self.source) == self.reader_census["source_digest"]
+                except OSError:
+                    self.census_verified = False
+            origin = f"{module}.{field}"
+            if self.census_verified and origin in self.reader_census["readers"]:
+                readers = self.reader_census["readers"][origin]
+                if readers is None:
+                    return None
+                return self.unobserved | {self.numbers_by_id[node] for node in readers if node in self.numbers_by_id}
         census = self._load(tree_for)
         if self.recorded.unresolved:
             return None

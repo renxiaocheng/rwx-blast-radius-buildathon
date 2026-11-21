@@ -59,6 +59,30 @@ def site_name(path: str, node: ast.Compare, op: str) -> str:
     return f"{path}:{node.lineno}:{node.col_offset}:{op}"
 
 
+def registered_lines(path: str, nodes: Iterable[ast.AST], sites: set[str]) -> frozenset[int]:
+    """Find the full old source spans of probes in an already parsed file."""
+    coordinates = {int(site.rsplit(":", 3)[1]) for site in sites}
+    lines = set()
+    for node in nodes:
+        if not isinstance(node, ast.Compare) or node.lineno not in coordinates:
+            continue
+        op = operation(node)
+        if op is not None and site_name(path, node, op) in sites:
+            lines.update(range(node.lineno, node.end_lineno + 1))
+    return frozenset(lines)
+
+
+def touches_registered_lines(edits: Iterable[PatchEdit], lines: frozenset[int] | None) -> bool:
+    if lines is None:
+        return True
+    edits = tuple(edits)
+    # Gaps are already outside branch_changes' proof. At least one textual
+    # removal must touch a registered old comparison for a proof to succeed.
+    return all(edit.removed and edit.added for edit in edits) and any(
+        line in lines for edit in edits for line in range(edit.start, edit.start + len(edit.removed))
+    )
+
+
 def guard_comparisons(expression: ast.expr):
     if isinstance(expression, ast.Compare):
         yield expression
@@ -263,14 +287,18 @@ def bound_argument(node: ast.Name, parents: Mapping[ast.AST, ast.AST]) -> bool:
     )
 
 
-def replacement_operand(old: ast.expr, new: ast.expr, parents: Mapping[ast.AST, ast.AST]) -> tuple[bool, int | None]:
+def replacement_operand(
+    old: ast.expr, new: ast.expr, parent_map: Callable[[], Mapping[ast.AST, ast.AST]],
+) -> tuple[bool, int | None]:
     if ast.dump(old) == ast.dump(new):
         return True, None
     constant = int_literal(new)
     # A later visit can raise before the probe is called. Require removed
     # lookups to be literals or parameters that cannot be unbound in scope.
-    pure = int_literal(old) is not None or isinstance(old, ast.Name) and bound_argument(old, parents)
-    return constant is not None and pure, constant
+    if constant is None:
+        return False, None
+    pure = int_literal(old) is not None or isinstance(old, ast.Name) and bound_argument(old, parent_map())
+    return pure, constant
 
 
 def branch_changes(path: str, lines: Sequence[str], edits: Iterable[PatchEdit]) -> tuple[GuardEdit, ...]:
@@ -282,8 +310,6 @@ def branch_changes(path: str, lines: Sequence[str], edits: Iterable[PatchEdit]) 
         return ()
     old_text, new_text = ("\n".join(parts) + "\n" for parts in (lines, patched))
     try:
-        if comments(old_text) != comments(new_text):
-            return ()
         trees = [ast.parse(text, path, type_comments=True) for text in (old_text, new_text)]
         matched = []
         for tree, change in zip(trees, (old_changes, new_changes)):
@@ -300,13 +326,20 @@ def branch_changes(path: str, lines: Sequence[str], edits: Iterable[PatchEdit]) 
             return ()
 
         changes = []
-        parents = {child: node for node in ast.walk(trees[0]) for child in ast.iter_child_nodes(node)}
+        parents = None
+
+        def parent_map():
+            nonlocal parents
+            if parents is None:
+                parents = {child: node for node in ast.walk(trees[0]) for child in ast.iter_child_nodes(node)}
+            return parents
+
         # Only the selected comparison nodes may differ. Match old/new sites
         # in AST traversal order and confirm the unedited structure below.
         for before, after in zip(*matched):
             previous, current = operation(before), operation(after)
-            valid_left, left = replacement_operand(before.left, after.left, parents)
-            valid_right, right = replacement_operand(before.comparators[0], after.comparators[0], parents)
+            valid_left, left = replacement_operand(before.left, after.left, parent_map)
+            valid_right, right = replacement_operand(before.comparators[0], after.comparators[0], parent_map)
             if not valid_left or not valid_right:
                 return ()
             if previous != current or left is not None or right is not None:
@@ -314,7 +347,13 @@ def branch_changes(path: str, lines: Sequence[str], edits: Iterable[PatchEdit]) 
             after.left, after.ops, after.comparators = before.left, before.ops, before.comparators
         if not changes or ast.dump(trees[0]) != ast.dump(trees[1]):
             return ()
-        if closure_signature(symtable.symtable(old_text, path, "exec")) != closure_signature(symtable.symtable(new_text, path, "exec")):
+        if comments(old_text) != comments(new_text):
+            return ()
+        # Only a removed Name can change lexical scope. Operators and the
+        # accepted integer literals have no bindings to compare.
+        if parents is not None and closure_signature(symtable.symtable(old_text, path, "exec")) != closure_signature(
+            symtable.symtable(new_text, path, "exec")
+        ):
             return ()
         return tuple(changes)
     except (SyntaxError, ValueError, RecursionError, tokenize.TokenError):

@@ -12,7 +12,7 @@ from types import CodeType
 from typing import Iterable
 
 from attribute_witnesses import AttributeWitnesses
-from branch_witnesses import BranchEvidence, branch_changes, branch_tests
+from branch_witnesses import BranchEvidence, branch_changes, branch_tests, registered_lines, touches_registered_lines
 from comparison_witnesses import ComparisonEvidence, comparison_changes, comparison_tests, unpack_comparison_row
 from condition_witnesses import equivalent_for, replacements
 from dialect_impact import DialectImpact
@@ -51,6 +51,7 @@ class SourceFile:
     lines: list[str]
     bodies: list[FunctionBody]
     code: CodeType
+    branch_lines: frozenset[int] | None = None
 
 
 @dataclass
@@ -117,10 +118,12 @@ class ExecutionWitnesses:
         self.comparison_complete = frozenset(data.get("comparison_complete", ()))
         self.conditions = data.get("condition_witnesses", {}).get("sites", {})
         self.branches = None
+        self.branch_sites = defaultdict(set)
         if "branch_witnesses" in data:
             self.branches = BranchEvidence()
             self.branches.merge(data["branch_witnesses"])
-            self.branch_files = {site.split(":", 1)[0] for site in self.branches.sites}
+            for site in self.branches.sites:
+                self.branch_sites[site.split(":", 1)[0]].add(site)
             self.branch_complete = frozenset(data.get("branch_complete", ()))
         self.comparison_files = {site[0] for site in self.comparison_rows}
         self.condition_files = {site.split(":", 1)[0] for site in self.conditions}
@@ -145,7 +148,7 @@ class ExecutionWitnesses:
         if "position_witnesses" in data:
             self.positions = PositionWitnesses(source, data["position_witnesses"], numbers_by_id)
 
-    def expression_tests(self, name, lines, edits, candidates, source_readers, *, single_file=False):
+    def expression_tests(self, name, lines, edits, candidates, source_readers, *, single_file=False, branch_lines=None):
         eligible = {self.ids_by_number[number] for number in candidates - source_readers - self.unobserved}
         if not eligible:
             return candidates
@@ -167,7 +170,10 @@ class ExecutionWitnesses:
             }
             candidates = candidates - {self.numbers_by_id[node] for node in proven}
             eligible -= proven
-        if single_file and self.branches is not None and name in self.branch_files:
+        if (
+            single_file and name in self.branch_sites
+            and touches_registered_lines(edits, branch_lines)
+        ):
             eligible &= self.branch_complete
             changes = branch_changes(name, lines, edits) if eligible else ()
             if changes:
@@ -334,16 +340,21 @@ def read_coverage(path: Path, numbers_by_id: dict[str, int]) -> CoverageIndex:
     )
 
 
-def read_source(path: Path) -> SourceFile:
+def read_source(path: Path, *, name: str | None = None, branch_sites: set[str] | None = None) -> SourceFile:
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(path))
+    nodes = ast.walk(tree)
+    branch_lines = None
+    if branch_sites and name is not None:
+        nodes = tuple(nodes)
+        branch_lines = registered_lines(name, nodes, branch_sites)
     bodies = [
         FunctionBody(node.body[0].lineno, node.end_lineno, node.body[0].col_offset)
-        for node in ast.walk(tree)
+        for node in nodes
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
     bodies.sort(key=lambda body: body.end - body.start)
-    return SourceFile(source.splitlines(), bodies, compile(tree, str(path), "exec", dont_inherit=True))
+    return SourceFile(source.splitlines(), bodies, compile(tree, str(path), "exec", dont_inherit=True), branch_lines)
 
 
 def compiled_patch(name: str, lines: list[str], edits: list[Edit]) -> tuple[list[str], CodeType] | None:
@@ -488,7 +499,8 @@ def select_tests(
             return None
         if name not in source_cache:
             try:
-                source_cache[name] = read_source(source / name)
+                branch_sites = witnesses.branch_sites.get(name) if witnesses is not None else None
+                source_cache[name] = read_source(source / name, name=name, branch_sites=branch_sites)
             except (OSError, SyntaxError, UnicodeError):
                 source_cache[name] = None
         original = source_cache[name]
@@ -527,6 +539,7 @@ def select_tests(
             if source_readers is not None:
                 narrowed = source_readers | witnesses.expression_tests(
                     name, original.lines, edits, narrowed, source_readers, single_file=len(files) == 1,
+                    branch_lines=original.branch_lines,
                 )
             selected.update(narrowed)
             continue
@@ -540,6 +553,7 @@ def select_tests(
             if source_readers is not None:
                 file_tests = witnesses.expression_tests(
                     name, original.lines, edits, file_tests, source_readers, single_file=len(files) == 1,
+                    branch_lines=original.branch_lines,
                 )
             selected.update(file_tests)
             continue

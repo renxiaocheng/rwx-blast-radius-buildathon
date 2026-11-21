@@ -50,12 +50,16 @@ for separate observations. The generator profile records calls to the pinned
 guards and reflective module-namespace reads. For supported guard edits, the
 recorded operand ranges can show that a test would take the same branch.
 For supported mapping edits, the selector combines key and namespace reads
-with source checks for consumers of a derived membership set. Incomplete
-observations keep the corresponding tests selected.
+with source checks for consumers of a derived membership set. It follows
+test-helper references down to individual tests when the pinned source
+establishes a direct call. Incomplete observations keep the corresponding
+tests selected.
 
 The isolated source inspection replay is in `position_witnesses.py`. Combine
-the raw reports with the baseline using `extend_witnesses.py --help`. These
-reports use the unmodified pinned checkout and the official test catalog.
+the raw reports with the baseline using `extend_witnesses.py --help`. Pass
+the pinned source with `--source` when packing `--impact` reports to build
+the namespace reader index ahead of scoring. These reports use the unmodified
+pinned checkout and the official test catalog.
 
 ## The problem
 

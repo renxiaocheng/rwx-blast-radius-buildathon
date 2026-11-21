@@ -358,14 +358,72 @@ def _observed_local_alias(path: str, node: ast.Name, parents: dict[ast.AST, ast.
     return _observed_value(path, rhs, node.id, sites)
 
 
-def _reflective_accesses(path: str, nodes, parents, aliases) -> Iterable[Access]:
+def _loop_attribute_names(argument: ast.AST, parents) -> set[str]:
+    if not isinstance(argument, ast.Name):
+        return set()
+    scope = _function_scope(argument, parents)
+    if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return set()
+    inside = argument
+    while (parent := parents.get(inside)) is not None and parent is not scope:
+        if isinstance(parent, ast.For) and inside in parent.body and isinstance(parent.target, ast.Tuple):
+            target = next((item for item in parent.target.elts if isinstance(item, ast.Name) and item.id == argument.id), None)
+            if target is not None:
+                break
+        inside = parent
+    else:
+        return set()
+    if any(
+        (isinstance(node, ast.Name) and node.id == argument.id and node is not target and not isinstance(node.ctx, ast.Load))
+        or (isinstance(node, (ast.Global, ast.Nonlocal)) and argument.id in node.names)
+        or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)) and node.name == argument.id)
+        or (isinstance(node, ast.alias) and (node.asname or node.name.partition(".")[0]) == argument.id)
+        or (isinstance(node, ast.arg) and node.arg == argument.id)
+        or (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == argument.id)
+        or (isinstance(node, ast.MatchMapping) and node.rest == argument.id)
+        for node in ast.walk(scope)
+    ):
+        return set()
+    if not isinstance(parent.iter, (ast.Tuple, ast.List)) or any(isinstance(node, ast.Starred) for node in parent.target.elts):
+        return set()
+    offset = parent.target.elts.index(target)
+    names = set()
+    for row in parent.iter.elts:
+        if not isinstance(row, (ast.Tuple, ast.List)) or len(row.elts) != len(parent.target.elts):
+            return set()
+        if any(isinstance(item, ast.Starred) for item in row.elts):
+            return set()
+        attribute = _literal_name(row.elts[offset])
+        if attribute is None:
+            return set()
+        names.add(attribute)
+    return names
+
+
+def _reflective_accesses(path: str, nodes, parents, aliases, *, test_sources: bool = False) -> Iterable[Access]:
     for node in nodes:
         if isinstance(node, ast.Attribute) and node.attr == "__dict__" and isinstance(node.ctx, ast.Load):
             yield Access((path, node.lineno, "__dict__"), _dictionary_field(node, parents))
         elif isinstance(node, ast.Call):
             witness = _call_access(path, node, aliases)
             if witness is not None:
-                yield witness[1]
+                symbol, access = witness
+                if (
+                    test_sources and access.field_pattern is None and isinstance(node.func, ast.Name)
+                    and node.func.id == symbol == "getattr" and len(node.args) >= 2
+                    and not any(
+                        isinstance(item, ast.Name) and item.id == symbol and not isinstance(item.ctx, ast.Load)
+                        or isinstance(item, ast.arg) and item.arg == symbol
+                        or isinstance(item, ast.alias) and (item.asname or item.name.partition(".")[0]) == symbol
+                        or isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and item.name == symbol
+                        for item in nodes
+                    )
+                ):
+                    names = _loop_attribute_names(node.args[1], parents)
+                    if names:
+                        yield from (Access((path, node.lineno, name), name) for name in sorted(names))
+                        continue
+                yield access
         elif isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load):
             name = _name(node)
             if aliases.get(name, name) in _REFLECTIVE_READS:
@@ -543,7 +601,7 @@ class AttributeWitnesses:
                 names.update(re.findall(r"\b[A-Za-z_]\w*\b", node.value))
             elif isinstance(node, ast.alias):
                 names.update(node.name.split("."))
-        reflection = tuple(_reflective_accesses(filename, nodes, parents, _reflection_aliases(tree)))
+        reflection = tuple(_reflective_accesses(filename, nodes, parents, _reflection_aliases(tree), test_sources=True))
         result = (names, reflection)
         self.test_accesses[filename] = result
         return result

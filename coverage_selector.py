@@ -12,11 +12,15 @@ from types import CodeType
 from typing import Iterable
 
 from attribute_witnesses import AttributeWitnesses
-from comparison_witnesses import ComparisonEvidence, comparison_changes, comparison_tests
+from comparison_witnesses import ComparisonEvidence, comparison_changes, comparison_tests, unpack_comparison_row
 from condition_witnesses import equivalent_for, replacements
 from dialect_impact import DialectImpact
+from generator_impact import GeneratorImpact
+from mapping_witnesses import MappingWitnesses
 from patch_impact import statement_impact
+from position_witnesses import PositionWitnesses
 from source_impact import changed_test_methods, compiled_equivalent, expression_arg_types_impact
+from tokenizer_impact import TokenizerImpact
 
 
 HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*$")
@@ -62,6 +66,7 @@ class CoverageIndex:
     shared_source_reads: set[str]
     observes_source: bool
     dedicated_importers: dict[str, set[int]]
+    isolated_import_tests: set[int]
 
 
 class TestSourceIndex:
@@ -104,14 +109,32 @@ class ExecutionWitnesses:
         self.unobserved = {
             number for node, number in numbers_by_id.items() if node not in self.reliable
         }
-        self.comparisons = ComparisonEvidence()
-        self.comparisons.merge(data.get("comparison_witnesses", ()))
+        self.comparison_rows = defaultdict(list)
+        for row in data.get("comparison_witnesses", ()):
+            self.comparison_rows[tuple(row[:4])].append(row)
+        self.comparison_ids = data.get("comparison_node_ids", ())
+        self.comparison_complete = frozenset(data.get("comparison_complete", ()))
         self.conditions = data.get("condition_witnesses", {}).get("sites", {})
-        self.comparison_files = {site[0] for site in self.comparisons.by_site}
+        self.comparison_files = {site[0] for site in self.comparison_rows}
         self.condition_files = {site.split(":", 1)[0] for site in self.conditions}
         self.attributes = None
         if "attribute_witnesses" in data:
             self.attributes = AttributeWitnesses(source, data["attribute_witnesses"], numbers_by_id)
+        self.tokenizer = None
+        if "tokenizer_witnesses" in data:
+            self.tokenizer = TokenizerImpact(source, data["tokenizer_witnesses"], numbers_by_id)
+            complete = set(data.get("tokenizer_complete", ()))
+            self.tokenizer_unobserved = {number for node, number in numbers_by_id.items() if node not in complete}
+        self.mapping = None
+        if "mapping_witnesses" in data:
+            self.mapping = MappingWitnesses(source, data["mapping_witnesses"], numbers_by_id)
+        self.generator = None
+        if "generator_witnesses" in data:
+            self.generator = GeneratorImpact(source, data["generator_witnesses"], numbers_by_id)
+            self.generator_complete = frozenset(data.get("generator_complete", ()))
+        self.positions = None
+        if "position_witnesses" in data:
+            self.positions = PositionWitnesses(source, data["position_witnesses"], numbers_by_id)
 
     def expression_tests(self, name, lines, edits, candidates, source_readers):
         eligible = {self.ids_by_number[number] for number in candidates - source_readers - self.unobserved}
@@ -119,7 +142,12 @@ class ExecutionWitnesses:
             return candidates
         sites = comparison_changes(name, lines, edits) if name in self.comparison_files else None
         if sites:
-            required = comparison_tests(sites, eligible, self.comparisons)
+            evidence = ComparisonEvidence()
+            evidence.merge(
+                unpack_comparison_row(row, self.comparison_ids)
+                for site in sites for row in self.comparison_rows.get(site, ())
+            )
+            required = comparison_tests(sites, eligible, evidence, self.comparison_complete)
             if required is not None and required != eligible:
                 return candidates - {self.numbers_by_id[node] for node in eligible - required}
         changes = replacements(name, lines, edits) if name in self.condition_files else ()
@@ -264,6 +292,14 @@ def read_coverage(path: Path, numbers_by_id: dict[str, int]) -> CoverageIndex:
     dedicated_importers = {
         name: {import_test} for name in recorded_import.get("imported_files", ())
     } if import_test is not None else {}
+    isolated_import_tests = set()
+    if (
+        import_test is not None and dedicated_importers
+        and recorded_import.get("source_pin") == "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
+        and recorded_import.get("class_attribute_reads") == [["sqlglot.dialects.dialect.Dialect", "_classes"]]
+        and recorded_import.get("source_reads") == []
+    ):
+        isolated_import_tests.add(import_test)
     return CoverageIndex(
         by_line,
         unmeasured_tests,
@@ -277,6 +313,7 @@ def read_coverage(path: Path, numbers_by_id: dict[str, int]) -> CoverageIndex:
         set(coverage.get("shared_source_reads", [])),
         "source_reads" in coverage,
         dedicated_importers,
+        isolated_import_tests,
     )
 
 
@@ -450,20 +487,23 @@ def select_tests(
             selected.update(method_tests)
             continue
         patched, code = compiled
+        position_readers = set() if test_sources is None else test_sources.mentioning(SOURCE_POSITION_NAMES)
+        if len(files) == 1 and witnesses is not None and witnesses.positions is not None:
+            position_readers = witnesses.positions.refine(name, position_readers)
         if coverage.observes_source and test_sources is not None and compiled_equivalent(
             original.lines, patched, edits, original.code, code,
         ):
             if name in coverage.shared_source_reads:
                 return None
             selected.update(coverage.source_reads.get(name, set()))
-            selected.update(test_sources.mentioning(SOURCE_POSITION_NAMES))
+            selected.update(position_readers)
             continue
         if name not in coverage.lines:
             return None
         source_readers = None
         if witnesses is not None and coverage.observes_source and test_sources is not None:
             if name not in coverage.shared_source_reads:
-                source_readers = coverage.source_reads.get(name, set()) | test_sources.mentioning(SOURCE_POSITION_NAMES)
+                source_readers = coverage.source_reads.get(name, set()) | position_readers
         collection_lines = coverage.collection.get(name, set())
         narrowed = statement_tests(name, original.lines, edits, coverage.lines[name], collection_lines)
         if narrowed:
@@ -484,6 +524,27 @@ def select_tests(
             continue
         # The isolated import test may inspect class data created by module code.
         selected.update(coverage.dedicated_importers.get(name, ()))
+        if len(files) == 1 and source_readers is not None and witnesses.tokenizer is not None:
+            readers = witnesses.tokenizer.select(name, original.lines, edits, mentions=test_sources.mentioning)
+            if readers is not None:
+                selected.update(readers, witnesses.tokenizer_unobserved - coverage.isolated_import_tests, source_readers)
+                continue
+        if len(files) == 1 and source_readers is not None and witnesses.mapping is not None:
+            readers = witnesses.mapping.select_patch(
+                name, original.lines, edits, attributes=witnesses.attributes, mentions=test_sources.mentioning,
+            )
+            if readers is not None:
+                selected.update(readers, witnesses.mapping.unobserved - coverage.isolated_import_tests, source_readers)
+                continue
+        if len(files) == 1 and source_readers is not None and witnesses.generator is not None:
+            observed_importers = {witnesses.ids_by_number[number] for number in coverage.isolated_import_tests}
+            readers = witnesses.generator.select(
+                name, original.lines, edits, complete=witnesses.generator_complete | observed_importers,
+                mentions=test_sources.mentioning,
+            )
+            if readers is not None:
+                selected.update(readers, source_readers)
+                continue
         if source_readers is not None and witnesses.attributes is not None and dialects is not None:
             reads = witnesses.attributes.select_patch(
                 name, original.lines, edits, dialect_targets=dialects.targets, mentions=test_sources.mentioning,

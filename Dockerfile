@@ -10,7 +10,8 @@ CMD ["python", "-B", "-c", "import selector; selector.WORKERS = 4; selector.main
 
 FROM runtime AS submission
 COPY coverage_selector.py dialect_impact.py patch_impact.py source_impact.py /app/
-COPY attribute_witnesses.py comparison_witnesses.py condition_witnesses.py /app/
+COPY attribute_witnesses.py comparison_witnesses.py condition_witnesses.py tokenizer_impact.py /app/
+COPY mapping_impact.py mapping_witnesses.py generator_impact.py position_witnesses.py /app/
 COPY vendor/coverage.json.gz /app/coverage.json.gz
 COPY vendor/dialect-index.json.gz /app/dialect-index.json.gz
 COPY vendor/witnesses.json.gz /app/witnesses.json.gz

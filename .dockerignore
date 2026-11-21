@@ -8,6 +8,11 @@
 !attribute_witnesses.py
 !comparison_witnesses.py
 !condition_witnesses.py
+!tokenizer_impact.py
+!mapping_impact.py
+!mapping_witnesses.py
+!generator_impact.py
+!position_witnesses.py
 !vendor/
 vendor/*
 !vendor/coverage.json.gz

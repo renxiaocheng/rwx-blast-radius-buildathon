@@ -377,8 +377,16 @@ def comparison_changes(name: str, lines: Sequence[str], edits: Iterable[Edit]) -
         return None
 
 
-def comparison_tests(sites: Iterable[Site], candidates: set, evidence: ComparisonEvidence) -> set | None:
-    """Keep any candidate without positive equivalence for every changed site."""
+def unpack_comparison_row(row: Sequence, node_ids: Sequence[str]) -> Sequence:
+    if not node_ids:
+        return row
+    return (*row[:-1], {node_ids[int(number)]: samples for number, samples in row[-1].items()})
+
+
+def comparison_tests(
+    sites: Iterable[Site], candidates: set, evidence: ComparisonEvidence, complete: frozenset[str] = frozenset(),
+) -> set | None:
+    """Keep tests with a different or unresolved comparison at any changed site."""
     sites = tuple(sites)
     if not sites or any(site in evidence.shared or site not in evidence.by_site for site in sites):
         return None
@@ -387,6 +395,7 @@ def comparison_tests(sites: Iterable[Site], candidates: set, evidence: Compariso
         records = evidence.by_site[site]
         proven = {
             node for node in proven
-            if (samples := records.get(node)) and all(confirms_equivalence(sample, site[3]) for sample in samples)
+            if (node in complete and node not in records)
+            or ((samples := records.get(node)) and all(confirms_equivalence(sample, site[3]) for sample in samples))
         }
     return candidates - proven

@@ -24,12 +24,12 @@ from coverage_worker import AuditTrace, WorkerTask, initialize_worker, run_task,
 
 
 class TestCoverage:
-    def __init__(self, tracer, numbers, source, directory, witness_fields=(), important=()):
+    def __init__(self, tracer, numbers, source, directory, witness_fields=(), important=(), witness_mode="full"):
         self.tracer = tracer
         self.numbers = numbers
         self.source = source
         self.directory = Path(directory)
-        self.audit = AuditTrace(source, witness_fields, important)
+        self.audit = AuditTrace(source, witness_fields, important, witness_mode)
         self.passed = defaultdict(set)
         self.incomplete = set()
         self.traced_pools = WeakSet()
@@ -80,7 +80,7 @@ class TestCoverage:
                     original_init(
                         executor, max_workers, mp_context, initialize_worker,
                         (str(self.source), str(self.directory), payload,
-                         self.audit.witness_fields, self.audit.important), **options
+                         self.audit.witness_fields, self.audit.important, self.audit.witness_mode), **options
                     )
                     self.traced_pools.add(executor)
                     return
@@ -201,6 +201,7 @@ class TestCoverage:
             "collection": collection,
             "unmeasured": unmeasured,
             "test_ids": {str(entry["number"]): entry["id"] for entry in catalog},
+            "witness_mode": self.audit.witness_mode,
             "subprocess_coverage": True,
             "fixtures": {
                 path: sorted(self.numbers[node] for node in nodes if node in self.numbers)
@@ -226,14 +227,32 @@ def main():
     parser.add_argument("--source", type=Path, required=True, help="Pinned SQLGlot checkout")
     parser.add_argument("--test-catalog", type=Path, required=True, help="Official tests.json")
     parser.add_argument("--output", type=Path, required=True, help="Per-test coverage JSON path")
-    parser.add_argument("--witnesses", action="store_true", help="Collect value and class-read witnesses")
+    witness_options = parser.add_mutually_exclusive_group()
+    witness_options.add_argument("--witnesses", action="store_true", help="Collect value and class-read witnesses")
+    witness_options.add_argument("--comparison-witnesses", action="store_true", help="Trace comparisons for every selected test")
+    witness_options.add_argument("--tokenizer-witnesses", action="store_true", help="Trace keys in pinned tokenizer inputs")
+    witness_options.add_argument("--mapping-witnesses", action="store_true", help="Trace key access in pinned shared mappings")
+    witness_options.add_argument("--generator-witnesses", action="store_true", help="Trace calls to pinned name-generating closures")
     args = parser.parse_args()
     source = args.source.resolve()
     output = args.output.resolve()
     catalog = json.loads(args.test_catalog.read_text())["tests"]
     numbers = {entry["id"]: entry["number"] for entry in catalog}
     witness_fields = candidate_attribute_names(source) if args.witnesses else ()
-    important = {entry["id"] for entry in catalog if entry["seconds"] >= 0.1} if args.witnesses else ()
+    important = ()
+    if args.comparison_witnesses:
+        important = numbers.keys()
+    elif args.witnesses:
+        important = {entry["id"] for entry in catalog if entry["seconds"] >= 0.1}
+    witness_mode = "full"
+    if args.comparison_witnesses:
+        witness_mode = "comparisons"
+    elif args.tokenizer_witnesses:
+        witness_mode = "tokenizer"
+    elif args.mapping_witnesses:
+        witness_mode = "mapping"
+    elif args.generator_witnesses:
+        witness_mode = "generator"
 
     os.chdir(source)
     os.environ["SKIP_INTEGRATION"] = "0"
@@ -242,7 +261,7 @@ def main():
         config_file=False, data_file=None, source=[str(source / "sqlglot")]
     )
     with TemporaryDirectory(prefix="sqlglot-worker-coverage-") as workers:
-        collector = TestCoverage(tracer, numbers, source, workers, witness_fields, important)
+        collector = TestCoverage(tracer, numbers, source, workers, witness_fields, important, witness_mode)
         with tracer.collect(), collector.subprocess_tracing(), trace_observations(collector.audit):
             status = pytest.main(
                 ["-q", "--continue-on-collection-errors", "-p", "no:cacheprovider", "tests"],

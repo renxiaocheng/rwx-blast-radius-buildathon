@@ -34,6 +34,23 @@ for the static index generator. Run `collect_coverage.py --witnesses` and pass
 the reports and pinned `--source` to `pack_witnesses.py` to regenerate the
 runtime profile and its static field access index.
 
+The selector can also read pinned observations of individual mapping keys and
+numeric escape prefixes. Key-level selection applies when the patch keeps the
+mapping's ordered keys and changes a supported value. The lookup trace follows
+the loaded mapping by identity, and direct consumers, shared reads, and
+unresolved uses constrain narrowing. A separate tokenizer trace records only
+escape prefixes entering the actual tokenizer. Each profile tracks which tests
+finished with that observer installed. Tests outside its coverage and any
+unresolved edit retain their conservative selection.
+
+`collect_coverage.py` provides `--comparison-witnesses`, `--mapping-witnesses`,
+`--tokenizer-witnesses`, and `--generator-witnesses` for separate observations.
+The generator profile records calls to the pinned `rename_func` closures.
+The isolated
+source inspection replay is in `position_witnesses.py`. Combine the raw reports
+with the baseline using `extend_witnesses.py --help`. These reports use the
+unmodified pinned checkout and the official test catalog.
+
 ## The problem
 
 Your image gets a batch of code changes to [sqlglot](https://github.com/tobymao/sqlglot) at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. For each change, print which tests to run and how to split them across up to 8 workers.

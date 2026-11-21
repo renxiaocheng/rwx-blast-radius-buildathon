@@ -17,19 +17,26 @@ import coverage
 from attribute_witnesses import AttributeRecorder, dynamic_instrumentation, mark_preloaded_modules
 from comparison_witnesses import ComparisonEvidence, trace_witnesses
 from condition_witnesses import ConditionRecorder, PROBE
+from generator_impact import GeneratorRecorder, generator_instrumentation
+from mapping_witnesses import MappingRecorder, mapping_instrumentation
+from tokenizer_impact import TokenizerEvidence, trace_tokenizer_inputs
 
 
 PROCESS_EVENTS = {"subprocess.Popen", "os.system", "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty", "os.exec"}
 
 
 class AuditTrace:
-    def __init__(self, source, witness_fields=(), important=()):
+    def __init__(self, source, witness_fields=(), important=(), witness_mode="full"):
         self.source = str(source) + os.sep
         self.witness_fields = tuple(witness_fields)
         self.important = frozenset(important)
+        self.witness_mode = witness_mode
         self.comparisons = ComparisonEvidence()
         self.attributes = AttributeRecorder()
-        self.conditions = ConditionRecorder(self, important)
+        self.conditions = ConditionRecorder(self, important if witness_mode == "full" else ())
+        self.tokenizer_inputs = TokenizerEvidence() if witness_mode == "tokenizer" else None
+        self.mapping = MappingRecorder() if witness_mode == "mapping" else None
+        self.generator = GeneratorRecorder() if witness_mode == "generator" else None
         self.fixture_root = self.source + os.path.join("tests", "fixtures") + os.sep
         self.active = False
         self.node_id = None
@@ -124,7 +131,7 @@ class AuditTrace:
                         self.shared_class_uses.add(name)
                     else:
                         self.class_uses[name].add(context)
-        return {
+        observations = {
             "class_uses": {name: sorted(nodes) for name, nodes in self.class_uses.items()},
             "shared_class_uses": sorted(self.shared_class_uses),
             "source_reads": {path: sorted(nodes) for path, nodes in self.source_reads.items()},
@@ -133,6 +140,13 @@ class AuditTrace:
             "attribute_witnesses": self.attributes.export(),
             "condition_witnesses": self.conditions.export(),
         }
+        if self.tokenizer_inputs is not None:
+            observations["tokenizer_witnesses"] = self.tokenizer_inputs.export()
+        if self.mapping is not None:
+            observations["mapping_witnesses"] = self.mapping.export()
+        if self.generator is not None:
+            observations["generator_witnesses"] = self.generator.export()
+        return observations
 
     def merge_observations(self, data):
         for name, nodes in data.get("class_uses", {}).items():
@@ -145,15 +159,41 @@ class AuditTrace:
         if "attribute_witnesses" in data:
             self.attributes.merge(data["attribute_witnesses"])
         self.conditions.merge(data.get("condition_witnesses", {}))
+        if self.tokenizer_inputs is not None:
+            self.tokenizer_inputs.merge(data.get("tokenizer_witnesses"))
+        if self.mapping is not None:
+            self.mapping.merge(data["mapping_witnesses"])
+        if self.generator is not None:
+            self.generator.merge(data["generator_witnesses"])
 
 
 @contextmanager
 def trace_observations(audit):
+    source = Path(audit.source)
+    if audit.witness_mode in {"mapping", "generator"}:
+        if any(name == "sqlglot" or name.startswith("sqlglot.") for name in sys.modules):
+            raise RuntimeError("Load the key and dispatch tracer before SQLGlot")
+        if audit.mapping is not None:
+            transform, helpers = mapping_instrumentation(source, audit.mapping, audit.current_test)
+        else:
+            transform, helpers = generator_instrumentation(source, audit.generator, audit.current_test)
+        with trace_witnesses(source, audit, comparisons=False, extra_transformer=transform, extra_helpers=helpers), trace_class_uses(audit):
+            yield
+        return
+    if audit.witness_mode == "tokenizer":
+        with trace_tokenizer_inputs(source, audit), trace_class_uses(audit):
+            yield
+        return
     if not audit.witness_fields and not audit.important:
         with trace_class_uses(audit):
             yield
         return
-    source = Path(audit.source)
+    if audit.witness_mode == "comparisons":
+        if any(name == "sqlglot" or name.startswith("sqlglot.") for name in sys.modules):
+            raise RuntimeError("Load the comparison tracer before SQLGlot")
+        with trace_witnesses(source, audit), trace_class_uses(audit):
+            yield
+        return
     mark_preloaded_modules(source, audit.attributes)
     attributes, helpers = dynamic_instrumentation(audit.attributes, audit.current_test)
     helpers[PROBE] = audit.conditions
@@ -220,12 +260,12 @@ class WorkerTask:
 
 
 class WorkerTrace:
-    def __init__(self, source, directory, witness_fields, important):
+    def __init__(self, source, directory, witness_fields, important, witness_mode):
         self.base = Path(directory) / f"worker-{os.getpid()}-{uuid4().hex}"
         self.tracer = coverage.Coverage(
             config_file=False, data_file=str(self.base.with_suffix(".cov")), source=[str(Path(source) / "sqlglot")]
         )
-        self.audit = AuditTrace(source, witness_fields, important)
+        self.audit = AuditTrace(source, witness_fields, important, witness_mode)
         self.task_ids = []
         self.tracer.start()
         sys.addaudithook(self.audit.audit)
@@ -249,9 +289,9 @@ class WorkerTrace:
 _worker_trace = None
 
 
-def initialize_worker(source, directory, encoded_initializer, witness_fields=(), important=()):
+def initialize_worker(source, directory, encoded_initializer, witness_fields=(), important=(), witness_mode="full"):
     global _worker_trace
-    _worker_trace = WorkerTrace(source, directory, witness_fields, important)
+    _worker_trace = WorkerTrace(source, directory, witness_fields, important, witness_mode)
     tracing = trace_observations(_worker_trace.audit)
     tracing.__enter__()
     Finalize(None, tracing.__exit__, (None, None, None), exitpriority=-1)

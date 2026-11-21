@@ -44,12 +44,18 @@ finished with that observer installed. Tests outside its coverage and any
 unresolved edit retain their conservative selection.
 
 `collect_coverage.py` provides `--comparison-witnesses`, `--mapping-witnesses`,
-`--tokenizer-witnesses`, and `--generator-witnesses` for separate observations.
-The generator profile records calls to the pinned `rename_func` closures.
-The isolated
-source inspection replay is in `position_witnesses.py`. Combine the raw reports
-with the baseline using `extend_witnesses.py --help`. These reports use the
-unmodified pinned checkout and the official test catalog.
+`--tokenizer-witnesses`, `--generator-witnesses`, and `--impact-witnesses`
+for separate observations. The generator profile records calls to the pinned
+`rename_func` closures. The impact profile tracks integer comparisons in
+guards and reflective module-namespace reads. For supported guard edits, the
+recorded operand ranges can show that a test would take the same branch.
+For supported mapping edits, the selector combines key and namespace reads
+with source checks for consumers of a derived membership set. Incomplete
+observations keep the corresponding tests selected.
+
+The isolated source inspection replay is in `position_witnesses.py`. Combine
+the raw reports with the baseline using `extend_witnesses.py --help`. These
+reports use the unmodified pinned checkout and the official test catalog.
 
 ## The problem
 

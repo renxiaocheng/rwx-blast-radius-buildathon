@@ -12,6 +12,7 @@ from types import CodeType
 from typing import Iterable
 
 from attribute_witnesses import AttributeWitnesses
+from branch_witnesses import BranchEvidence, branch_changes, branch_tests
 from comparison_witnesses import ComparisonEvidence, comparison_changes, comparison_tests, unpack_comparison_row
 from condition_witnesses import equivalent_for, replacements
 from dialect_impact import DialectImpact
@@ -115,6 +116,12 @@ class ExecutionWitnesses:
         self.comparison_ids = data.get("comparison_node_ids", ())
         self.comparison_complete = frozenset(data.get("comparison_complete", ()))
         self.conditions = data.get("condition_witnesses", {}).get("sites", {})
+        self.branches = None
+        if "branch_witnesses" in data:
+            self.branches = BranchEvidence()
+            self.branches.merge(data["branch_witnesses"])
+            self.branch_files = {site.split(":", 1)[0] for site in self.branches.sites}
+            self.branch_complete = frozenset(data.get("branch_complete", ()))
         self.comparison_files = {site[0] for site in self.comparison_rows}
         self.condition_files = {site.split(":", 1)[0] for site in self.conditions}
         self.attributes = None
@@ -127,7 +134,9 @@ class ExecutionWitnesses:
             self.tokenizer_unobserved = {number for node, number in numbers_by_id.items() if node not in complete}
         self.mapping = None
         if "mapping_witnesses" in data:
-            self.mapping = MappingWitnesses(source, data["mapping_witnesses"], numbers_by_id)
+            self.mapping = MappingWitnesses(
+                source, data["mapping_witnesses"], numbers_by_id, namespaces=data.get("module_mapping_witnesses"),
+            )
         self.generator = None
         if "generator_witnesses" in data:
             self.generator = GeneratorImpact(source, data["generator_witnesses"], numbers_by_id)
@@ -136,7 +145,7 @@ class ExecutionWitnesses:
         if "position_witnesses" in data:
             self.positions = PositionWitnesses(source, data["position_witnesses"], numbers_by_id)
 
-    def expression_tests(self, name, lines, edits, candidates, source_readers):
+    def expression_tests(self, name, lines, edits, candidates, source_readers, *, single_file=False):
         eligible = {self.ids_by_number[number] for number in candidates - source_readers - self.unobserved}
         if not eligible:
             return candidates
@@ -156,7 +165,15 @@ class ExecutionWitnesses:
                 node for node in eligible
                 if all(equivalent_for(change, self.conditions[change.site].get(node)) for change in changes)
             }
-            return candidates - {self.numbers_by_id[node] for node in proven}
+            candidates = candidates - {self.numbers_by_id[node] for node in proven}
+            eligible -= proven
+        if single_file and self.branches is not None and name in self.branch_files:
+            eligible &= self.branch_complete
+            changes = branch_changes(name, lines, edits) if eligible else ()
+            if changes:
+                required = branch_tests(changes, eligible, self.branches, complete=self.branch_complete)
+                if required is not None and required != eligible:
+                    candidates = (candidates - {self.numbers_by_id[node] for node in eligible - required}) | source_readers
         return candidates
 
 
@@ -508,7 +525,9 @@ def select_tests(
         narrowed = statement_tests(name, original.lines, edits, coverage.lines[name], collection_lines)
         if narrowed:
             if source_readers is not None:
-                narrowed = witnesses.expression_tests(name, original.lines, edits, narrowed, source_readers)
+                narrowed = source_readers | witnesses.expression_tests(
+                    name, original.lines, edits, narrowed, source_readers, single_file=len(files) == 1,
+                )
             selected.update(narrowed)
             continue
         file_tests = set()
@@ -519,7 +538,9 @@ def select_tests(
             file_tests.update(tests)
         else:
             if source_readers is not None:
-                file_tests = witnesses.expression_tests(name, original.lines, edits, file_tests, source_readers)
+                file_tests = witnesses.expression_tests(
+                    name, original.lines, edits, file_tests, source_readers, single_file=len(files) == 1,
+                )
             selected.update(file_tests)
             continue
         # The isolated import test may inspect class data created by module code.

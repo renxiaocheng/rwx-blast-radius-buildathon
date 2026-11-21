@@ -12,6 +12,9 @@
 !mapping_impact.py
 !mapping_witnesses.py
 !generator_impact.py
+!branch_witnesses.py
+!shared_mapping_impact.py
+!shared_mapping_witnesses.py
 !position_witnesses.py
 !vendor/
 vendor/*

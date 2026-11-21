@@ -25,6 +25,7 @@ class MappingEdit:
     field: str
     kind: str
     key: str
+    literal_string_value: bool = False
 
 
 def _name(assignment: ast.stmt) -> str | None:
@@ -129,7 +130,7 @@ class MappingImpact:
             _lambda_factory(binding) or _returns_deferred_function(binding, module)
         )
 
-    def _dict_change(self, path: str, old: ast.Dict, new: ast.Dict, line: int) -> str | None:
+    def _dict_change(self, path: str, old: ast.Dict, new: ast.Dict, line: int) -> tuple[str, bool] | None:
         if len(old.keys) != len(new.keys) or any(
             ast.dump(before) != ast.dump(after) if before is not None and after is not None
             else before is not after
@@ -144,15 +145,19 @@ class MappingImpact:
             if label is None:
                 return None
             if _plain_value(before, after):
-                changed.append(label)
+                literal_string = (
+                    isinstance(before, ast.Constant) and isinstance(after, ast.Constant)
+                    and type(before.value) is str and type(after.value) is str
+                )
+                changed.append((label, literal_string))
             elif isinstance(before, ast.Lambda) and isinstance(after, ast.Lambda) and _constant_changes(before, after):
-                changed.append(label)
+                changed.append((label, False))
             elif (
                 isinstance(before, ast.Call) and isinstance(after, ast.Call)
                 and isinstance(before.func, ast.Name) and self._factory(path, before.func.id, line)
                 and _factory_arguments(before, after)
             ):
-                changed.append(label)
+                changed.append((label, False))
             else:
                 return None
         return changed[0] if len(changed) == 1 else None
@@ -181,8 +186,13 @@ class MappingImpact:
             new = new_assignments.get(origin)
             if old is None or new is None or ast.dump(old.value) == ast.dump(new.value):
                 continue
+            literal_string = False
             if isinstance(old.value, ast.Dict) and isinstance(new.value, ast.Dict):
-                kind, key = "dict", self._dict_change(path, old.value, new.value, old.lineno)
+                changed_entry = self._dict_change(path, old.value, new.value, old.lineno)
+                if changed_entry is None:
+                    return set()
+                kind = "dict"
+                key, literal_string = changed_entry
             elif isinstance(old.value, ast.Set) and isinstance(new.value, ast.Set):
                 original = {key_label(item) for item in old.value.elts if isinstance(item, ast.Constant)}
                 modified = {key_label(item) for item in new.value.elts if isinstance(item, ast.Constant)}
@@ -194,7 +204,7 @@ class MappingImpact:
                 return set()
             if key is None:
                 return set()
-            changes.add(MappingEdit(origin, origin.rsplit(".", 1)[-1], kind, key))
+            changes.add(MappingEdit(origin, origin.rsplit(".", 1)[-1], kind, key, literal_string))
             for ranges, assignment in zip(affected_ranges, (old, new)):
                 ranges.append((assignment.lineno, assignment.end_lineno))
             new.value = old.value

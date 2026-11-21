@@ -233,6 +233,7 @@ def main():
     witness_options.add_argument("--tokenizer-witnesses", action="store_true", help="Trace keys in pinned tokenizer inputs")
     witness_options.add_argument("--mapping-witnesses", action="store_true", help="Trace key access in pinned shared mappings")
     witness_options.add_argument("--generator-witnesses", action="store_true", help="Trace calls to pinned name-generating closures")
+    witness_options.add_argument("--impact-witnesses", action="store_true", help="Trace branch operands and module namespace reads")
     args = parser.parse_args()
     source = args.source.resolve()
     output = args.output.resolve()
@@ -253,6 +254,8 @@ def main():
         witness_mode = "mapping"
     elif args.generator_witnesses:
         witness_mode = "generator"
+    elif args.impact_witnesses:
+        witness_mode = "impact"
 
     os.chdir(source)
     os.environ["SKIP_INTEGRATION"] = "0"

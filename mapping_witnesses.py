@@ -11,6 +11,8 @@ from types import FunctionType, MethodType
 from attribute_witnesses import _REFLECTIVE_READS, _reflection_aliases, _reflective_accesses
 from dialect_impact import _module_name
 from mapping_impact import MappingImpact, declarations, key_label
+from shared_mapping_impact import derived_mapping_readers
+from shared_mapping_witnesses import ModuleMappingWitnesses
 
 
 _REG = "__rwx_mapping_register__"
@@ -385,7 +387,7 @@ def mapping_instrumentation(source: Path, recorder: MappingRecorder, current_nod
 
 
 class MappingWitnesses:
-    def __init__(self, source: Path, payload: Mapping, numbers_by_id: Mapping[str, int]):
+    def __init__(self, source: Path, payload: Mapping, numbers_by_id: Mapping[str, int], *, namespaces=None):
         self.source = source
         self.numbers_by_id = numbers_by_id
         self.files_by_number = {value: node.partition("::")[0] for node, value in numbers_by_id.items()}
@@ -399,6 +401,7 @@ class MappingWitnesses:
         self.cached_census = payload.get("census")
         self.site_census = None
         self.test_trees = {}
+        self.namespaces = None if namespaces is None else ModuleMappingWitnesses(source, namespaces, numbers_by_id)
 
     @staticmethod
     def _digest(value) -> str:
@@ -505,21 +508,18 @@ class MappingWitnesses:
         targets = self.impact.changes(path, lines, edits)
         if not targets or self.recorded.unresolved or self.unobserved is None:
             return None
-        if attributes is None:
-            return None
         result = set()
         for target in targets:
             origin, field, key, kind = target.origin, target.field, target.key, target.kind
+            derived = origin in self.recorded.opaque
             if (
-                origin not in self.recorded.declared or origin in self.recorded.opaque
+                origin not in self.recorded.declared or (derived and not target.literal_string_value)
                 or (kind == "set" and origin in self.recorded.keys_only)
             ):
                 return None
             receiver = origin.rpartition(".")[0]
-            if receiver == _module_name(path):
-                # A module-global field can be retrieved reflectively without
-                # exposing a tracked class receiver. That evidence is not yet
-                # available to this proof path.
+            module_field = receiver == _module_name(path)
+            if (module_field and (self.namespaces is None or derived)) or (not module_field and attributes is None):
                 return None
             labels = self.recorded.labels.get((origin, key), set())
             if not labels and key.startswith("Constant("):
@@ -547,13 +547,27 @@ class MappingWitnesses:
             required = self._census().get(field, set())
             if self.recorded.unresolved or not required or not required <= self.recorded.sites:
                 return None
-            attributes._load()
-            if (
-                attributes.recorder.unresolved
-                or not any(receiver in names for _, names, _ in attributes.by_field.get(field, ()))
-                or attributes._has_dynamic_read(receiver, field)
-            ):
-                return None
+            if module_field:
+                protected = self.namespaces.select(path, receiver, field, tree_for=self.impact._tree, mentions=mentions)
+                if protected is None:
+                    return None
+                result.update(protected)
+            else:
+                attributes._load()
+                if (
+                    attributes.recorder.unresolved
+                    or not any(receiver in names for _, names, _ in attributes.by_field.get(field, ()))
+                    or attributes._has_dynamic_read(receiver, field)
+                ):
+                    return None
+                if derived:
+                    consumers = derived_mapping_readers(
+                        path, target, required=required, tree_for=self.impact._tree,
+                        attributes=attributes, mentions=mentions,
+                    )
+                    if consumers is None:
+                        return None
+                    result.update(consumers)
             result.update(witnessed)
             by_file = defaultdict(set)
             for number in mentions({field, "__dict__"} | _REFLECTIVE_READS):

@@ -104,6 +104,16 @@ class LocalExpressions(ast.NodeVisitor):
                 self.mask(node, "value", node.end_lineno)
         elif self.in_function and isinstance(node, (ast.If, ast.While)):
             self.mask(node, "test", node.test.end_lineno)
+        elif self.in_function and isinstance(node, (ast.For, ast.AsyncFor)):
+            self.mask(node, "iter", node.iter.end_lineno)
+        elif self.in_function and isinstance(node, ast.Match):
+            self.mask(node, "subject", node.subject.end_lineno)
+        elif self.in_function and isinstance(node, ast.Raise):
+            self.mask(node, "exc", node.end_lineno)
+            self.mask(node, "cause", node.end_lineno)
+        elif self.in_function and isinstance(node, ast.Assert):
+            self.mask(node, "test", node.end_lineno)
+            self.mask(node, "msg", node.end_lineno)
         super().generic_visit(node)
 
     def mask(self, node: ast.stmt, attribute: str, end: int) -> None:

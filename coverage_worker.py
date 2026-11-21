@@ -15,10 +15,12 @@ from uuid import uuid4
 import coverage
 
 from attribute_witnesses import AttributeRecorder, dynamic_instrumentation, mark_preloaded_modules
+from branch_witnesses import BranchEvidence, branch_instrumentation
 from comparison_witnesses import ComparisonEvidence, trace_witnesses
 from condition_witnesses import ConditionRecorder, PROBE
 from generator_impact import GeneratorRecorder, generator_instrumentation
 from mapping_witnesses import MappingRecorder, mapping_instrumentation
+from shared_mapping_witnesses import ModuleMappingRecorder, module_mapping_instrumentation
 from tokenizer_impact import TokenizerEvidence, trace_tokenizer_inputs
 
 
@@ -37,6 +39,8 @@ class AuditTrace:
         self.tokenizer_inputs = TokenizerEvidence() if witness_mode == "tokenizer" else None
         self.mapping = MappingRecorder() if witness_mode == "mapping" else None
         self.generator = GeneratorRecorder() if witness_mode == "generator" else None
+        self.branches = BranchEvidence() if witness_mode == "impact" else None
+        self.module_mappings = ModuleMappingRecorder() if witness_mode == "impact" else None
         self.fixture_root = self.source + os.path.join("tests", "fixtures") + os.sep
         self.active = False
         self.node_id = None
@@ -146,6 +150,9 @@ class AuditTrace:
             observations["mapping_witnesses"] = self.mapping.export()
         if self.generator is not None:
             observations["generator_witnesses"] = self.generator.export()
+        if self.branches is not None:
+            observations["branch_witnesses"] = self.branches.export()
+            observations["module_mapping_witnesses"] = self.module_mappings.export()
         return observations
 
     def merge_observations(self, data):
@@ -165,18 +172,38 @@ class AuditTrace:
             self.mapping.merge(data["mapping_witnesses"])
         if self.generator is not None:
             self.generator.merge(data["generator_witnesses"])
+        if self.branches is not None:
+            self.branches.merge(data["branch_witnesses"])
+            self.module_mappings.merge(data["module_mapping_witnesses"])
+
+
+def impact_instrumentation(source, audit):
+    paths = {"sqlglot/parser.py", "sqlglot/tokenizer_core.py", "sqlglot/generator.py", "sqlglot/expressions/core.py"}
+    for package in ("optimizer", "executor"):
+        paths.update(path.relative_to(source).as_posix() for path in (source / "sqlglot" / package).glob("*.py"))
+    branch_transform, branch_helpers = branch_instrumentation(
+        source, audit.branches, audit.current_test, paths=paths,
+    )
+    namespace_transform, namespace_helpers = module_mapping_instrumentation(source, audit.module_mappings, audit.current_test)
+
+    def transform(path, tree):
+        return namespace_transform(path, branch_transform(path, tree))
+
+    return transform, branch_helpers | namespace_helpers
 
 
 @contextmanager
 def trace_observations(audit):
     source = Path(audit.source)
-    if audit.witness_mode in {"mapping", "generator"}:
+    if audit.witness_mode in {"mapping", "generator", "impact"}:
         if any(name == "sqlglot" or name.startswith("sqlglot.") for name in sys.modules):
             raise RuntimeError("Load the key and dispatch tracer before SQLGlot")
         if audit.mapping is not None:
             transform, helpers = mapping_instrumentation(source, audit.mapping, audit.current_test)
-        else:
+        elif audit.generator is not None:
             transform, helpers = generator_instrumentation(source, audit.generator, audit.current_test)
+        else:
+            transform, helpers = impact_instrumentation(source, audit)
         with trace_witnesses(source, audit, comparisons=False, extra_transformer=transform, extra_helpers=helpers), trace_class_uses(audit):
             yield
         return

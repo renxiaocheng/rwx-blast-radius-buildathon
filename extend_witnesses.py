@@ -6,8 +6,10 @@ import json
 from pathlib import Path
 
 from comparison_witnesses import ComparisonEvidence, unpack_comparison_row
+from branch_witnesses import BranchEvidence
 from generator_impact import GeneratorRecorder
 from mapping_witnesses import MappingRecorder, MappingWitnesses
+from shared_mapping_witnesses import ModuleMappingRecorder
 from tokenizer_impact import TokenizerEvidence
 
 
@@ -98,6 +100,23 @@ def supplement_generators(profile: dict, reports: list[Path]) -> None:
     profile["generator_complete"] = sorted(complete)
 
 
+def supplement_impact(profile: dict, reports: list[Path]) -> None:
+    branches = BranchEvidence()
+    namespaces = ModuleMappingRecorder()
+    complete = set()
+    for path in reports:
+        report = load_profile(path)
+        if report.get("witness_mode") != "impact":
+            raise ValueError(f"Expected a branch and namespace trace in {path}")
+        complete.update(completed_tests(report))
+        branches.merge(report["branch_witnesses"])
+        namespaces.merge(report["module_mapping_witnesses"])
+    profile["branch_witnesses"] = branches.export()
+    profile["branch_complete"] = sorted(complete)
+    profile["module_mapping_witnesses"] = namespaces.export()
+    profile["module_mapping_witnesses"]["reliable"] = sorted(complete)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", type=Path, required=True)
@@ -107,6 +126,7 @@ def main():
     parser.add_argument("--mappings", type=Path, nargs="+", default=[])
     parser.add_argument("--positions", type=Path, help="Pinned test's source inspection observations")
     parser.add_argument("--generator", type=Path, nargs="+", default=[])
+    parser.add_argument("--impact", type=Path, nargs="+", default=[])
     parser.add_argument("--compact-comparisons", action="store_true", help="Store comparison test IDs once")
     parser.add_argument("--source", type=Path, help="Pinned source for the mapping site census")
     args = parser.parse_args()
@@ -121,6 +141,8 @@ def main():
         profile["position_witnesses"] = load_profile(args.positions)
     if args.generator:
         supplement_generators(profile, args.generator)
+    if args.impact:
+        supplement_impact(profile, args.impact)
     if args.compact_comparisons:
         compact_comparisons(profile)
     with args.output.open("wb") as stream:

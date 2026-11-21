@@ -19,7 +19,7 @@ from weakref import WeakSet
 import coverage
 import pytest
 
-from coverage_worker import AuditTrace, WorkerTask, initialize_worker, run_task
+from coverage_worker import AuditTrace, WorkerTask, initialize_worker, run_task, trace_class_uses
 
 
 class TestCoverage:
@@ -146,6 +146,7 @@ class TestCoverage:
             task_ids = metadata["tasks"]
             exported.update(task_ids)
             self.audit.merge_fixtures(metadata["fixtures"], metadata["fixture_collection"])
+            self.audit.merge_observations(metadata)
             self.audit.unknown_tests.update(metadata["unknown_tests"])
             self.audit.unknown_shared |= metadata["unknown_shared"]
 
@@ -187,6 +188,12 @@ class TestCoverage:
                 collection[path] = contiguous_ranges(collected_lines)
         unmeasured = [entry["number"] for entry in catalog if str(entry["number"]) not in measured]
         print(f"Merged {traced_tasks}/{len(self.pool_tasks)} spawned pool tasks.")
+        observations = self.audit.export_observations()
+        for key in ("class_uses", "source_reads"):
+            observations[key] = {
+                name: sorted(self.numbers[node] for node in nodes if node in self.numbers)
+                for name, nodes in sorted(observations[key].items())
+            }
         return {
             "coverage": measured,
             "collection": collection,
@@ -198,6 +205,7 @@ class TestCoverage:
                 for path, nodes in sorted(self.audit.fixtures.items())
             },
             "fixture_collection": sorted(self.audit.fixture_collection),
+            **observations,
         }
 
 
@@ -230,7 +238,7 @@ def main():
     )
     with TemporaryDirectory(prefix="sqlglot-worker-coverage-") as workers:
         collector = TestCoverage(tracer, numbers, source, workers)
-        with tracer.collect(), collector.subprocess_tracing():
+        with tracer.collect(), collector.subprocess_tracing(), trace_class_uses(collector.audit):
             status = pytest.main(
                 ["-q", "--continue-on-collection-errors", "-p", "no:cacheprovider", "tests"],
                 plugins=[collector],

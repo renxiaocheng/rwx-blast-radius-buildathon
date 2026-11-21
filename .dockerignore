@@ -2,6 +2,9 @@
 !Dockerfile
 !selector.py
 !coverage_selector.py
+!dialect_impact.py
+!patch_impact.py
+!source_impact.py
 !vendor/
 vendor/*
 !vendor/coverage.json.gz

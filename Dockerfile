@@ -9,7 +9,7 @@ WORKDIR /app
 CMD ["python", "-B", "-c", "import selector; selector.WORKERS = 4; selector.main()"]
 
 FROM runtime AS submission
-COPY coverage_selector.py /app/coverage_selector.py
+COPY coverage_selector.py dialect_impact.py patch_impact.py source_impact.py /app/
 COPY vendor/coverage.json.gz /app/coverage.json.gz
 ADD vendor/sqlglot-eb11aec.tar.gz /app/sqlglot-source/
 CMD ["python", "-B", "/app/coverage_selector.py", "--coverage", "/app/coverage.json.gz", "--source", "/app/sqlglot-source"]

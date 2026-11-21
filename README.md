@@ -1,17 +1,21 @@
 # Blast Radius coverage-based entry
 
 This entry selects tests using per-test line coverage collected on SQLGlot at
-`eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. It uses the coverage of changed
-function bodies, keeps tests whose coverage is incomplete, and runs the full
-suite when it cannot identify an affected function safely. It chooses the
-worker count and grouping using the recorded test times and worker cost.
+`eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. It maps changed Python statements,
+static dialect configuration, and SQL fixtures to baseline test observations.
+For source-only edits it also considers source readers and tests that inspect
+Python code locations. It keeps tests whose coverage is incomplete and uses
+the full suite when the available evidence cannot bound an edit. Worker count
+and grouping use the recorded test times and per-worker overhead.
 
 The compressed coverage in `vendor/coverage.json.gz` was collected in the
 contest's Linux/amd64 Python 3.13 image using `collect_coverage.py` and
 `coverage_worker.py`. The collector attributes work in spawned process pools
-to the test that submitted it. It also records which tests read individual SQL
-fixtures. Tests without complete traces are always selected. The map uses test
-IDs to match the scorer's catalog and is based on the unmodified upstream tests.
+to the test that submitted it and records fixture reads, explicit Python-source
+reads, and SQLGlot class use. Three optimizer tests that hit a DuckDB error
+under x86 emulation were re-traced with the same dependency versions in a native
+Linux/arm64 container. The map uses test IDs to match the scorer's catalog and
+is based on the unmodified upstream tests.
 The second archive in `vendor/` contains Python source from the pinned SQLGlot
 revision and its upstream license.
 

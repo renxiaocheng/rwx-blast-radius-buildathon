@@ -1,6 +1,8 @@
 """Spawn-safe Python coverage instrumentation for SQLGlot's test pools."""
 
 from collections import defaultdict
+from contextlib import contextmanager
+from functools import wraps
 import json
 from multiprocessing.process import BaseProcess
 from multiprocessing.reduction import ForkingPickler
@@ -25,6 +27,11 @@ class AuditTrace:
         self.in_call = False
         self.fixtures = defaultdict(set)
         self.fixture_collection = set()
+        self.source_reads = defaultdict(set)
+        self.shared_source_reads = set()
+        self.class_uses = defaultdict(set)
+        self.shared_class_uses = set()
+        self._classes_by_context = defaultdict(set)
         self.unknown_tests = set()
         self.unknown_shared = False
 
@@ -57,11 +64,87 @@ class AuditTrace:
                     self.fixtures[relative].add(self.node_id)
                 else:
                     self.fixture_collection.add(relative)
+            elif candidate.startswith(self.source + "sqlglot" + os.sep) and candidate.endswith(".py"):
+                caller = sys._getframe(1)
+                if caller.f_code.co_filename == "<frozen importlib._bootstrap_external>":
+                    return
+                relative = candidate[len(self.source):].replace(os.sep, "/")
+                if self.in_call and self.node_id is not None:
+                    self.source_reads[relative].add(self.node_id)
+                else:
+                    self.shared_source_reads.add(relative)
 
     def merge_fixtures(self, fixtures, collection):
         for name, nodes in fixtures.items():
             self.fixtures[name].update(nodes)
         self.fixture_collection.update(collection)
+
+    def record_class(self, instance):
+        if self.active:
+            test = self.node_id if self.in_call else None
+            self._classes_by_context[test].add(type(instance))
+
+    def export_observations(self):
+        for context, classes in self._classes_by_context.items():
+            for cls in classes:
+                for base in cls.__mro__:
+                    if not base.__module__.startswith("sqlglot."):
+                        continue
+                    name = f"{base.__module__}.{base.__qualname__}"
+                    if context is None:
+                        self.shared_class_uses.add(name)
+                    else:
+                        self.class_uses[name].add(context)
+        return {
+            "class_uses": {name: sorted(nodes) for name, nodes in self.class_uses.items()},
+            "shared_class_uses": sorted(self.shared_class_uses),
+            "source_reads": {path: sorted(nodes) for path, nodes in self.source_reads.items()},
+            "shared_source_reads": sorted(self.shared_source_reads),
+        }
+
+    def merge_observations(self, data):
+        for name, nodes in data.get("class_uses", {}).items():
+            self.class_uses[name].update(nodes)
+        self.shared_class_uses.update(data.get("shared_class_uses", []))
+        for name, nodes in data.get("source_reads", {}).items():
+            self.source_reads[name].update(nodes)
+        self.shared_source_reads.update(data.get("shared_source_reads", []))
+
+
+@contextmanager
+def trace_class_uses(audit):
+    from sqlglot.dialects.dialect import Dialect
+    from sqlglot.expressions.core import Expr
+    from sqlglot.generator import Generator
+    from sqlglot.parser import Parser
+    from sqlglot.tokens import Tokenizer
+
+    def traced(original):
+        @wraps(original)
+        def call(*args, **kwargs):
+            if args:
+                audit.record_class(args[0])
+            return original(*args, **kwargs)
+
+        return call
+
+    methods = (
+        (Dialect, "__init__"), (Dialect, "generate"), (Dialect, "parse"), (Dialect, "tokenize"),
+        (Expr, "__init__"), (Generator, "__init__"), (Generator, "generate"),
+        (Parser, "__init__"), (Parser, "parse"),
+        (Tokenizer, "__init__"), (Tokenizer, "tokenize"),
+    )
+    originals = []
+    try:
+        for owner, name in methods:
+            original = owner.__dict__.get(name)
+            if original is not None:
+                originals.append((owner, name, original))
+                setattr(owner, name, traced(original))
+        yield
+    finally:
+        for owner, name, original in reversed(originals):
+            setattr(owner, name, original)
 
 
 class WorkerTask:
@@ -101,6 +184,7 @@ class WorkerTrace:
             "fixture_collection": sorted(self.audit.fixture_collection),
             "unknown_tests": sorted(self.audit.unknown_tests),
             "unknown_shared": self.audit.unknown_shared,
+            **self.audit.export_observations(),
         }), encoding="utf-8")
 
 
@@ -110,6 +194,9 @@ _worker_trace = None
 def initialize_worker(source, directory, encoded_initializer):
     global _worker_trace
     _worker_trace = WorkerTrace(source, directory)
+    tracing = trace_class_uses(_worker_trace.audit)
+    tracing.__enter__()
+    Finalize(None, tracing.__exit__, (None, None, None), exitpriority=-1)
     original_start = BaseProcess.start
 
     def start_nested_process(process):

@@ -10,8 +10,17 @@ from pathlib import Path, PurePosixPath
 import re
 from typing import Iterable
 
+from dialect_impact import DialectImpact
+from patch_impact import statement_impact
+from source_impact import changed_test_methods, comment_only, expression_arg_types_impact
+
 
 HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*$")
+SOURCE_POSITION_NAMES = {
+    "__code__", "__traceback__", "co_code", "co_consts", "co_filename", "co_firstlineno",
+    "co_lnotab", "co_lines", "co_positions", "disassemble", "f_lineno", "getframeinfo",
+    "getsource", "getsourcefile", "getsourcelines", "linecache", "tb_lineno", "traceback",
+}
 
 
 @dataclass
@@ -42,6 +51,40 @@ class CoverageIndex:
     fixtures: dict[str, set[int]]
     shared_fixtures: set[str]
     subprocess_coverage: bool
+    class_uses: dict[str, set[int]]
+    shared_class_uses: set[str]
+    source_reads: dict[str, set[int]]
+    shared_source_reads: set[str]
+    observes_source: bool
+
+
+class TestSourceIndex:
+    def __init__(self, source: Path, catalog: list[dict]):
+        by_file = defaultdict(set)
+        self.by_method = defaultdict(set)
+        for test in catalog:
+            by_file[test["file"]].add(test["number"])
+            method = test["id"].rsplit("::", 1)[-1].split("[", 1)[0]
+            self.by_method[method].add(test["number"])
+        self.file_names = []
+        for path, numbers in by_file.items():
+            try:
+                text = (source / path).read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                self.file_names.append((None, numbers))
+            else:
+                self.file_names.append((set(re.findall(r"\b[A-Za-z_]\w*\b", text)), numbers))
+
+    def mentioning(self, names: set[str]) -> set[int]:
+        return set().union(*(
+            numbers for words, numbers in self.file_names if words is None or not words.isdisjoint(names)
+        ))
+
+    def named_methods(self, names: set[str]) -> set[int] | None:
+        # A catalog item may inherit a test method from another module.
+        if any(name not in self.by_method for name in names):
+            return None
+        return set().union(*(self.by_method[name] for name in names))
 
 
 def parse_patch(patch: str) -> list[tuple[str, list[Edit]]] | None:
@@ -157,17 +200,23 @@ def read_coverage(path: Path, numbers_by_id: dict[str, int]) -> CoverageIndex:
     collection = {
         name: set(covered_lines(spans)) for name, spans in coverage.get("collection", {}).items()
     }
-    fixtures = {
-        name: {number_map[str(number)] for number in numbers if str(number) in number_map}
-        for name, numbers in coverage.get("fixtures", {}).items()
-    }
+    def remap(key):
+        return {
+            name: {number_map[str(number)] for number in numbers if str(number) in number_map}
+            for name, numbers in coverage.get(key, {}).items()
+        }
     return CoverageIndex(
         by_line,
         unmeasured_tests,
         collection,
-        fixtures,
+        remap("fixtures"),
         set(coverage.get("fixture_collection", [])),
         coverage.get("subprocess_coverage") is True,
+        remap("class_uses"),
+        set(coverage.get("shared_class_uses", [])),
+        remap("source_reads"),
+        set(coverage.get("shared_source_reads", [])),
+        "source_reads" in coverage,
     )
 
 
@@ -256,11 +305,56 @@ def impacted_tests(
     return set().union(*(by_line.get(line, ()) for line in body_lines))
 
 
+def statement_tests(name, lines, edits, by_line, collection):
+    spans = statement_impact(name, lines, edits)
+    if spans is None or any(line in collection for span in spans for line in span):
+        return None
+    selected = set()
+    for span in spans:
+        tests = set().union(*(by_line.get(line, ()) for line in span))
+        if not tests:
+            return None
+        selected.update(tests)
+    return selected
+
+
+def class_tests(
+    classes: set[str], coverage: CoverageIndex, tests: TestSourceIndex, source: Path
+) -> set[int] | None:
+    if not classes or classes & coverage.shared_class_uses:
+        return None
+    if any(not coverage.class_uses.get(name) for name in classes):
+        return None
+    names = {name.rsplit(".", 1)[-1] for name in classes}
+    selection = tests.mentioning(names).union(*(coverage.class_uses[name] for name in classes))
+    names_pattern = "|".join(map(re.escape, sorted(names)))
+    # A library can read class metadata before instantiating the class. Map
+    # explicit reads back to their executable lines and defer if one is shared.
+    access = re.compile(rf"\b(?:{names_pattern})\s*\.\s*(?:arg_types|required_args)\b")
+    for filename in coverage.lines.keys() | coverage.collection.keys():
+        if not filename.startswith("sqlglot/") or not filename.endswith(".py"):
+            continue
+        try:
+            contents = (source / filename).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return None
+        for read in access.finditer(contents):
+            start = contents.count("\n", 0, read.start()) + 1
+            stop = contents.count("\n", 0, read.end()) + 1
+            for line in range(start, stop + 1):
+                if line in coverage.collection.get(filename, ()):
+                    return None
+                selection.update(coverage.lines.get(filename, {}).get(line, ()))
+    return selection
+
+
 def select_tests(
     patch: str,
     coverage: CoverageIndex,
     source: Path,
     source_cache: dict[str, SourceFile | None],
+    dialects: DialectImpact | None = None,
+    test_sources: TestSourceIndex | None = None,
 ) -> set[int] | None:
     files = parse_patch(patch)
     if files is None:
@@ -276,7 +370,7 @@ def select_tests(
                 return None
             selected.update(consumers)
             continue
-        if not name.startswith("sqlglot/") or not name.endswith(".py") or name not in coverage.lines:
+        if not name.startswith(("sqlglot/", "tests/")) or not name.endswith(".py"):
             return None
         if name not in source_cache:
             try:
@@ -286,12 +380,52 @@ def select_tests(
         original = source_cache[name]
         if original is None or not patch_compiles(name, original.lines, edits):
             return None
+        if name.startswith("tests/"):
+            methods = changed_test_methods(name, original.lines, edits)
+            if not methods or test_sources is None:
+                return None
+            method_tests = test_sources.named_methods(methods)
+            if method_tests is None:
+                return None
+            selected.update(method_tests)
+            continue
+        if coverage.observes_source and test_sources is not None and comment_only(name, original.lines, edits):
+            if name in coverage.shared_source_reads:
+                return None
+            selected.update(coverage.source_reads.get(name, set()))
+            selected.update(test_sources.mentioning(SOURCE_POSITION_NAMES))
+            continue
+        if name not in coverage.lines:
+            return None
         collection_lines = coverage.collection.get(name, set())
+        narrowed = statement_tests(name, original.lines, edits, coverage.lines[name], collection_lines)
+        if narrowed:
+            selected.update(narrowed)
+            continue
+        file_tests = set()
         for edit in edits:
             tests = impacted_tests(edit, coverage.lines[name], original.bodies, collection_lines)
             if not tests:
-                return None
-            selected.update(tests)
+                break
+            file_tests.update(tests)
+        else:
+            selected.update(file_tests)
+            continue
+        classes = expression_arg_types_impact(name, original.lines, edits)
+        if classes and test_sources is not None:
+            expression_tests = class_tests(classes, coverage, test_sources, source)
+            if expression_tests is not None:
+                selected.update(expression_tests)
+                continue
+        if dialects is not None:
+            related = dialects.select(
+                name, original.lines, edits,
+                class_uses=coverage.class_uses, shared_class_uses=coverage.shared_class_uses,
+            )
+            if related is not None:
+                selected.update(related)
+                continue
+        return None
     return selected
 
 
@@ -337,10 +471,12 @@ def main() -> None:
         coverage.unmeasured.update(test["number"] for test in catalog if test["file"] in subprocess_files)
 
     source_cache: dict[str, SourceFile | None] = {}
+    dialects = DialectImpact(args.source, coverage.lines, catalog)
+    test_sources = TestSourceIndex(args.source, catalog)
     full_schedule = schedule(durations.items())
     for path in sorted((args.data / "commits").glob("*.patch")):
         patch = path.read_text(encoding="utf-8", errors="surrogateescape")
-        selection = select_tests(patch, coverage, args.source, source_cache)
+        selection = select_tests(patch, coverage, args.source, source_cache, dialects, test_sources)
         workers = full_schedule
         if selection is not None and selection != test_numbers:
             workers = schedule((number, durations[number]) for number in selection)
